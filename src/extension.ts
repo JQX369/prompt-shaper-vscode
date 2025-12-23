@@ -599,7 +599,8 @@ class PromptShaperPanel {
     this._panel = panel;
     this._extensionUri = extensionUri;
 
-    this._initializeSession();
+    // Initialize session and preload transcript immediately
+    this._initializeAndPreload();
     this._update();
 
     this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
@@ -609,9 +610,6 @@ class PromptShaperPanel {
         switch (message.command) {
           case 'switchTab':
             this._currentTab = message.tab;
-            if (message.tab === 'transcript') {
-              await this._loadTranscript();
-            }
             this._update();
             break;
           case 'shapePrompt':
@@ -643,6 +641,26 @@ class PromptShaperPanel {
     );
   }
 
+  private async _initializeAndPreload() {
+    // Run initialization and transcript loading in parallel for speed
+    const workspaceRoot = getActiveWorkspaceRoot();
+    if (!workspaceRoot) {
+      this._isConnected = false;
+      this._sessionFile = null;
+      this._transcript = [];
+      return;
+    }
+
+    // Find session file once
+    this._sessionFile = await findBestSessionFile(workspaceRoot);
+    this._isConnected = this._sessionFile !== null && isClaudeCliInstalled();
+
+    // Preload transcript immediately if we have a session
+    if (this._sessionFile) {
+      this._loadTranscriptFromFile(this._sessionFile);
+    }
+  }
+
   private async _initializeSession() {
     const workspaceRoot = getActiveWorkspaceRoot();
     if (!workspaceRoot) {
@@ -653,21 +671,30 @@ class PromptShaperPanel {
 
     this._sessionFile = await findBestSessionFile(workspaceRoot);
     this._isConnected = this._sessionFile !== null && isClaudeCliInstalled();
+
+    // Also refresh transcript when connection is refreshed
+    if (this._sessionFile) {
+      await this._loadTranscriptFromFile(this._sessionFile);
+      this._update();
+    }
   }
 
   private async _loadTranscript() {
-    const workspaceRoot = getActiveWorkspaceRoot();
-    if (!workspaceRoot) {
-      this._transcript = [];
-      return;
+    if (this._sessionFile) {
+      await this._loadTranscriptFromFile(this._sessionFile);
+    } else {
+      // Try to find session file again
+      const workspaceRoot = getActiveWorkspaceRoot();
+      if (workspaceRoot) {
+        this._sessionFile = await findBestSessionFile(workspaceRoot);
+        if (this._sessionFile) {
+          await this._loadTranscriptFromFile(this._sessionFile);
+        }
+      }
     }
+  }
 
-    const sessionFile = await findBestSessionFile(workspaceRoot);
-    if (!sessionFile) {
-      this._transcript = [];
-      return;
-    }
-
+  private async _loadTranscriptFromFile(sessionFile: string) {
     try {
       const content = await readFullFile(sessionFile);
       const messages = parseJsonlMessages(content);
@@ -676,6 +703,8 @@ class PromptShaperPanel {
         content: m.content,
         timestamp: m.timestamp || '',
       }));
+      // Update UI after loading
+      this._update();
     } catch {
       this._transcript = [];
     }
