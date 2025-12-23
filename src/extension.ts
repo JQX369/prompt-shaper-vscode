@@ -601,9 +601,11 @@ class PromptShaperPanel {
     this._panel = panel;
     this._extensionUri = extensionUri;
 
-    // Initialize session and preload transcript immediately
-    this._initializeAndPreload();
+    // Show initial UI immediately, then load data
     this._update();
+
+    // Initialize session and preload transcript (will call _update again when ready)
+    this._initializeAndPreload();
 
     this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
 
@@ -659,7 +661,8 @@ class PromptShaperPanel {
 
     // Preload transcript immediately if we have a session
     if (this._sessionFile) {
-      this._loadTranscriptFromFile(this._sessionFile);
+      // Await the load so UI shows data on first render
+      await this._loadTranscriptFromFile(this._sessionFile);
       // Track mtime for change detection
       try {
         const stat = await fs.promises.stat(this._sessionFile);
@@ -741,7 +744,8 @@ class PromptShaperPanel {
 
   private async _loadTranscriptFromFile(sessionFile: string) {
     try {
-      const content = await readFullFile(sessionFile);
+      // Only read last 500KB for transcript display - much faster for large files
+      const content = await tailReadFile(sessionFile, 500000);
       const messages = parseJsonlMessages(content);
       this._transcript = messages.map(m => ({
         role: m.role,
