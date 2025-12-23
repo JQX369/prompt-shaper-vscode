@@ -1,0 +1,59 @@
+{
+  "name": "prompt-shaper",
+  "displayName": "Prompt Shaper",
+  "description": "Turn messy dictated text into structured, send-ready prompts for Claude Code",
+  "version": "1.0.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "promptShaper.dictateAndShape",
+        "title": "Prompt Shaper: Dictate → Shape → Copy"
+      }
+    ],
+    "configuration": {
+      "title": "Prompt Shaper",
+      "properties": {
+        "promptShaper.maxAssistantMessages": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 20,
+          "description": "Maximum number of recent assistant messages to include in context"
+        },
+        "promptShaper.maxUserMessages": {
+          "type": "number",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 20,
+          "description": "Maximum number of recent user messages to include in context"
+        },
+        "promptShaper.maxTailBytes": {
+          "type": "number",
+          "default": 250000,
+          "minimum": 10000,
+          "maximum": 5000000,
+          "description": "Maximum bytes to read from the end of session log files"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.74.0",
+    "typescript": "^5.3.0"
+  }
+}
