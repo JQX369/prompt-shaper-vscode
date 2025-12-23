@@ -132,7 +132,8 @@ function getClaudeProjectsPath(): string {
 }
 
 function encodeWorkspacePath(workspacePath: string): string {
-  return workspacePath.replace(/\//g, '-');
+  // Claude Code encodes paths by replacing / and spaces with -
+  return workspacePath.replace(/[\/\s]+/g, '-');
 }
 
 async function findJsonlFilesInDir(dir: string): Promise<{ path: string; mtime: Date }[]> {
