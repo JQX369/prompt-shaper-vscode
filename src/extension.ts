@@ -572,6 +572,8 @@ class PromptShaperPanel {
   private _transcript: TranscriptMessage[] = [];
   private _isConnected: boolean = false;
   private _sessionFile: string | null = null;
+  private _fileWatcher: fs.FSWatcher | null = null;
+  private _lastSessionMtime: number = 0;
 
   public static createOrShow(extensionUri: vscode.Uri) {
     const column = vscode.ViewColumn.Beside;
@@ -658,7 +660,50 @@ class PromptShaperPanel {
     // Preload transcript immediately if we have a session
     if (this._sessionFile) {
       this._loadTranscriptFromFile(this._sessionFile);
+      // Track mtime for change detection
+      try {
+        const stat = await fs.promises.stat(this._sessionFile);
+        this._lastSessionMtime = stat.mtimeMs;
+      } catch { /* ignore */ }
     }
+
+    // Set up file watcher on the projects directory to detect session changes
+    this._setupFileWatcher(workspaceRoot);
+  }
+
+  private _setupFileWatcher(workspaceRoot: string) {
+    // Clean up existing watcher
+    if (this._fileWatcher) {
+      this._fileWatcher.close();
+      this._fileWatcher = null;
+    }
+
+    const projectsPath = getClaudeProjectsPath();
+    if (!fs.existsSync(projectsPath)) return;
+
+    // Watch the projects directory for changes
+    try {
+      this._fileWatcher = fs.watch(projectsPath, { recursive: true }, async (eventType, filename) => {
+        if (!filename || !filename.endsWith('.jsonl')) return;
+
+        // Debounce - check if a new session file is more recent
+        const newSessionFile = await findBestSessionFile(workspaceRoot);
+        if (newSessionFile && newSessionFile !== this._sessionFile) {
+          // Session changed - reload
+          this._sessionFile = newSessionFile;
+          this._loadTranscriptFromFile(newSessionFile);
+        } else if (newSessionFile === this._sessionFile && this._sessionFile) {
+          // Same session but file changed - check mtime
+          try {
+            const stat = await fs.promises.stat(this._sessionFile);
+            if (stat.mtimeMs > this._lastSessionMtime + 1000) { // 1s debounce
+              this._lastSessionMtime = stat.mtimeMs;
+              this._loadTranscriptFromFile(this._sessionFile);
+            }
+          } catch { /* ignore */ }
+        }
+      });
+    } catch { /* ignore watch errors */ }
   }
 
   private async _initializeSession() {
@@ -828,6 +873,11 @@ class PromptShaperPanel {
   public dispose() {
     PromptShaperPanel.currentPanel = undefined;
     this._panel.dispose();
+    // Clean up file watcher
+    if (this._fileWatcher) {
+      this._fileWatcher.close();
+      this._fileWatcher = null;
+    }
     while (this._disposables.length) {
       const x = this._disposables.pop();
       if (x) x.dispose();
