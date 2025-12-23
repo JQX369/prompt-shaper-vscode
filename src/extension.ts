@@ -198,6 +198,7 @@ async function findBestSessionFile(workspaceRoot: string): Promise<string | null
     return null;
   }
 
+  // Try exact match first
   const encodedPath = encodeWorkspacePath(workspaceRoot);
   const exactDir = path.join(projectsPath, encodedPath);
 
@@ -209,6 +210,22 @@ async function findBestSessionFile(workspaceRoot: string): Promise<string | null
     }
   }
 
+  // Try parent directory (useful when Extension Dev Host opens subfolder)
+  const parentDir = path.dirname(workspaceRoot);
+  if (parentDir !== workspaceRoot) {
+    const encodedParent = encodeWorkspacePath(parentDir);
+    const parentSessionDir = path.join(projectsPath, encodedParent);
+
+    if (fs.existsSync(parentSessionDir)) {
+      const filesInDir = await findJsonlFilesInDir(parentSessionDir);
+      if (filesInDir.length > 0) {
+        filesInDir.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+        return filesInDir[0].path;
+      }
+    }
+  }
+
+  // Fallback: search all jsonl files and score them
   const allJsonlFiles = await findAllJsonlFiles(projectsPath);
 
   if (allJsonlFiles.length === 0) {
@@ -216,20 +233,29 @@ async function findBestSessionFile(workspaceRoot: string): Promise<string | null
   }
 
   const workspaceBasename = path.basename(workspaceRoot).toLowerCase();
+  const parentBasename = path.basename(path.dirname(workspaceRoot)).toLowerCase();
 
   const scored = allJsonlFiles.map(file => {
     let score = 0;
     const filePath = file.path.toLowerCase();
     const encodedLower = encodedPath.toLowerCase();
 
+    // Exact workspace match
     if (filePath.includes(encodedLower)) {
       score += 100;
     }
 
+    // Parent directory match (for subfolder scenarios)
+    if (parentBasename && filePath.includes(parentBasename)) {
+      score += 75;
+    }
+
+    // Basename match
     if (filePath.includes(workspaceBasename)) {
       score += 50;
     }
 
+    // Recency bonus
     const ageMs = Date.now() - file.mtime.getTime();
     const ageHours = ageMs / (1000 * 60 * 60);
     score += Math.max(0, 24 - ageHours);
