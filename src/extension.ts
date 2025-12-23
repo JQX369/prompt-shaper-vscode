@@ -289,6 +289,7 @@ function parseJsonlMessages(content: string): SessionMessage[] {
       let msgContent: string | null = null;
       let timestamp: string | undefined;
 
+      // Format 1: { type: 'user'|'assistant', message: { content: [...] } }
       if (obj.type === 'user' && obj.message?.content) {
         role = 'user';
         msgContent = extractContent(obj.message.content);
@@ -299,14 +300,22 @@ function parseJsonlMessages(content: string): SessionMessage[] {
         msgContent = extractContent(obj.message.content);
         timestamp = obj.timestamp;
       }
+      // Format 2: { role: 'user'|'assistant', content: ... }
       else if (obj.role === 'user' || obj.role === 'assistant') {
         role = obj.role;
         msgContent = extractContent(obj.content);
         timestamp = obj.timestamp;
       }
+      // Format 3: { message: { role: ..., content: ... } }
       else if (obj.message?.role === 'user' || obj.message?.role === 'assistant') {
         role = obj.message.role;
         msgContent = extractContent(obj.message.content);
+        timestamp = obj.timestamp;
+      }
+      // Format 4: Summary messages
+      else if (obj.type === 'summary' && obj.summary) {
+        role = 'assistant';
+        msgContent = `[Summary] ${obj.summary}`;
         timestamp = obj.timestamp;
       }
 
@@ -314,7 +323,7 @@ function parseJsonlMessages(content: string): SessionMessage[] {
         messages.push({ role, content: msgContent.trim(), timestamp });
       }
     } catch {
-      // Skip
+      // Skip malformed lines
     }
   }
 
@@ -330,6 +339,14 @@ function extractContent(value: unknown): string | null {
       .map(item => {
         if (typeof item === 'string') return item;
         if (item?.type === 'text' && item?.text) return item.text;
+        if (item?.type === 'tool_use' && item?.name) {
+          // Format tool use for display
+          return `[Tool: ${item.name}]`;
+        }
+        if (item?.type === 'tool_result' && item?.content) {
+          const resultContent = extractContent(item.content);
+          return resultContent ? `[Tool Result]\n${resultContent.slice(0, 500)}${resultContent.length > 500 ? '...' : ''}` : null;
+        }
         if (item?.text && !item?.type) return item.text;
         if (item?.content && typeof item.content === 'string') return item.content;
         return '';
@@ -780,23 +797,31 @@ class PromptShaperPanel {
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
     :root {
-      --bg: #1a1a1a;
-      --bg-secondary: #252525;
-      --bg-tertiary: #2d2d2d;
-      --text: #e5e5e5;
-      --text-dim: #888;
-      --accent: #3b82f6;
-      --accent-hover: #2563eb;
-      --border: #333;
-      --green: #22c55e;
-      --yellow: #eab308;
-      --red: #ef4444;
-      --radius: 8px;
-      --radius-lg: 12px;
+      --bg: #1c1c1e;
+      --bg-secondary: #2c2c2e;
+      --bg-tertiary: #3a3a3c;
+      --bg-elevated: #48484a;
+      --text: #f5f5f7;
+      --text-secondary: #a1a1a6;
+      --text-dim: #6e6e73;
+      --accent: #0a84ff;
+      --accent-hover: #409cff;
+      --accent-glow: rgba(10, 132, 255, 0.3);
+      --border: rgba(255, 255, 255, 0.1);
+      --border-strong: rgba(255, 255, 255, 0.15);
+      --green: #30d158;
+      --green-glow: rgba(48, 209, 88, 0.4);
+      --yellow: #ffd60a;
+      --red: #ff453a;
+      --purple: #bf5af2;
+      --radius: 10px;
+      --radius-lg: 14px;
+      --shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
+      --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.3);
     }
 
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', system-ui, sans-serif;
       font-size: 13px;
       color: var(--text);
       background: var(--bg);
@@ -804,78 +829,135 @@ class PromptShaperPanel {
       display: flex;
       flex-direction: column;
       -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
     }
 
-    /* Title bar - Mac style */
+    /* Title bar - Mac style with vibrancy effect */
     .titlebar {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 12px 16px;
-      background: var(--bg-secondary);
+      padding: 14px 18px;
+      background: linear-gradient(180deg, var(--bg-secondary) 0%, rgba(44, 44, 46, 0.95) 100%);
       border-bottom: 1px solid var(--border);
-      -webkit-app-region: drag;
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
     }
 
     .titlebar-left {
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 12px;
+    }
+
+    .status-indicator {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      padding: 4px 8px;
+      border-radius: 6px;
+      transition: background 0.2s;
+    }
+
+    .status-indicator:hover {
+      background: var(--bg-tertiary);
     }
 
     .status-dot {
-      width: 10px;
-      height: 10px;
+      width: 8px;
+      height: 8px;
       border-radius: 50%;
       background: var(--green);
-      box-shadow: 0 0 6px var(--green);
-      transition: all 0.3s;
+      box-shadow: 0 0 8px var(--green-glow), 0 0 12px var(--green-glow);
+      animation: pulse 2s ease-in-out infinite;
+      transition: all 0.3s ease;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.7; }
     }
 
     .status-dot.disconnected {
       background: var(--red);
-      box-shadow: 0 0 6px var(--red);
+      box-shadow: 0 0 8px rgba(255, 69, 58, 0.4);
+      animation: none;
+    }
+
+    .status-text {
+      font-size: 11px;
+      color: var(--text-secondary);
+      font-weight: 500;
     }
 
     .title {
-      font-size: 14px;
+      font-size: 15px;
       font-weight: 600;
-      letter-spacing: -0.3px;
+      letter-spacing: -0.4px;
+      background: linear-gradient(135deg, var(--text) 0%, var(--text-secondary) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
     }
 
     .workspace-badge {
       font-size: 11px;
-      color: var(--text-dim);
+      color: var(--text-secondary);
       background: var(--bg-tertiary);
-      padding: 3px 8px;
-      border-radius: 4px;
+      padding: 5px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      font-weight: 500;
+      max-width: 180px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
-    /* Tab navigation */
+    /* Tab navigation - pill style */
     .tabs {
       display: flex;
       background: var(--bg-secondary);
       border-bottom: 1px solid var(--border);
-      padding: 0 8px;
+      padding: 10px 12px;
+      gap: 6px;
     }
 
     .tab {
-      padding: 10px 16px;
+      padding: 8px 16px;
       cursor: pointer;
       border: none;
       background: transparent;
-      color: var(--text-dim);
+      color: var(--text-secondary);
       font-size: 12px;
       font-weight: 500;
-      transition: all 0.2s;
-      border-bottom: 2px solid transparent;
-      margin-bottom: -1px;
+      transition: all 0.2s ease;
+      border-radius: 8px;
+      position: relative;
     }
 
-    .tab:hover { color: var(--text); }
+    .tab:hover {
+      color: var(--text);
+      background: var(--bg-tertiary);
+    }
+
     .tab.active {
       color: var(--text);
-      border-bottom-color: var(--accent);
+      background: var(--bg-tertiary);
+      box-shadow: var(--shadow-sm);
+    }
+
+    .tab.active::after {
+      content: '';
+      position: absolute;
+      bottom: -10px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 20px;
+      height: 2px;
+      background: var(--accent);
+      border-radius: 1px;
     }
 
     /* Content areas */
@@ -901,96 +983,149 @@ class PromptShaperPanel {
       overflow-y: auto;
     }
 
-    /* Input area */
+    /* Input area - floating style */
     .input-area {
-      padding: 12px 16px;
-      background: var(--bg-secondary);
-      border-top: 1px solid var(--border);
+      padding: 12px 16px 16px;
+      background: linear-gradient(180deg, transparent 0%, var(--bg-secondary) 30%);
+    }
+
+    .input-container {
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-lg);
+      padding: 4px;
+      box-shadow: var(--shadow-sm);
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+
+    .input-container:focus-within {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-glow), var(--shadow-sm);
     }
 
     .input-row {
       display: flex;
       gap: 8px;
+      align-items: flex-end;
     }
 
     textarea {
       flex: 1;
-      padding: 10px 12px;
-      border: 1px solid var(--border);
+      padding: 12px 14px;
+      border: none;
       border-radius: var(--radius);
-      background: var(--bg);
+      background: transparent;
       color: var(--text);
       font-family: inherit;
-      font-size: 13px;
+      font-size: 14px;
       resize: none;
       min-height: 44px;
-      transition: border-color 0.2s;
+      max-height: 120px;
+      line-height: 1.4;
     }
 
     textarea:focus {
       outline: none;
-      border-color: var(--accent);
     }
 
-    textarea::placeholder { color: var(--text-dim); }
+    textarea::placeholder {
+      color: var(--text-dim);
+    }
 
     button {
-      padding: 10px 16px;
+      padding: 10px 18px;
       border: none;
       border-radius: var(--radius);
       background: var(--accent);
       color: white;
       cursor: pointer;
-      font-size: 12px;
-      font-weight: 500;
-      transition: all 0.2s;
+      font-size: 13px;
+      font-weight: 600;
+      transition: all 0.2s ease;
+      white-space: nowrap;
     }
 
-    button:hover { background: var(--accent-hover); }
-    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button:hover {
+      background: var(--accent-hover);
+      transform: translateY(-1px);
+    }
+
+    button:active {
+      transform: translateY(0);
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      transform: none;
+    }
 
     button.ghost {
-      background: transparent;
+      background: var(--bg-elevated);
       border: 1px solid var(--border);
-      color: var(--text-dim);
+      color: var(--text-secondary);
     }
 
     button.ghost:hover {
       background: var(--bg-tertiary);
       color: var(--text);
+      border-color: var(--border-strong);
     }
 
     button.small {
-      padding: 6px 10px;
+      padding: 6px 12px;
       font-size: 11px;
+      font-weight: 500;
     }
 
-    /* Messages */
+    /* Messages - chat bubble style */
     .messages {
       display: flex;
       flex-direction: column;
-      gap: 12px;
+      gap: 16px;
+      padding-bottom: 8px;
     }
 
     .message {
-      padding: 12px 14px;
-      border-radius: var(--radius-lg);
-      max-width: 90%;
-      line-height: 1.5;
+      max-width: 85%;
+      animation: messageIn 0.3s ease-out;
+    }
+
+    @keyframes messageIn {
+      from {
+        opacity: 0;
+        transform: translateY(10px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
     }
 
     .message.user {
-      background: var(--accent);
-      color: white;
       align-self: flex-end;
-      border-bottom-right-radius: 4px;
     }
 
     .message.assistant {
+      align-self: flex-start;
+    }
+
+    .message-bubble {
+      padding: 12px 16px;
+      border-radius: 18px;
+      line-height: 1.5;
+    }
+
+    .message.user .message-bubble {
+      background: var(--accent);
+      color: white;
+      border-bottom-right-radius: 6px;
+    }
+
+    .message.assistant .message-bubble {
       background: var(--bg-tertiary);
       border: 1px solid var(--border);
-      align-self: flex-start;
-      border-bottom-left-radius: 4px;
+      border-bottom-left-radius: 6px;
     }
 
     .message-content {
@@ -998,37 +1133,148 @@ class PromptShaperPanel {
       word-break: break-word;
     }
 
+    .message-time {
+      font-size: 10px;
+      color: var(--text-dim);
+      margin-top: 4px;
+      padding: 0 4px;
+    }
+
+    .message.user .message-time {
+      text-align: right;
+    }
+
+    /* Typing indicator */
+    .typing-indicator {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 16px;
+      animation: messageIn 0.3s ease-out;
+    }
+
+    .typing-avatar {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--purple) 0%, var(--accent) 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+    }
+
+    .typing-bubble {
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border);
+      padding: 14px 18px;
+      border-radius: 18px;
+      border-bottom-left-radius: 6px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .typing-dot {
+      width: 8px;
+      height: 8px;
+      background: var(--text-dim);
+      border-radius: 50%;
+      animation: typingBounce 1.4s ease-in-out infinite;
+    }
+
+    .typing-dot:nth-child(2) { animation-delay: 0.2s; }
+    .typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+    @keyframes typingBounce {
+      0%, 60%, 100% { transform: translateY(0); }
+      30% { transform: translateY(-6px); }
+    }
+
     /* Transcript */
-    .transcript-item {
-      padding: 12px;
+    .transcript-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
       border-bottom: 1px solid var(--border);
     }
 
-    .transcript-item:last-child { border-bottom: none; }
+    .transcript-title {
+      font-weight: 600;
+      font-size: 14px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .transcript-count {
+      font-size: 11px;
+      color: var(--text-dim);
+      background: var(--bg-tertiary);
+      padding: 2px 8px;
+      border-radius: 10px;
+    }
+
+    .transcript-list {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .transcript-item {
+      padding: 14px 16px;
+      border-radius: var(--radius);
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      transition: all 0.2s;
+    }
+
+    .transcript-item:hover {
+      background: var(--bg-tertiary);
+      border-color: var(--border-strong);
+    }
+
+    .transcript-item-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
 
     .transcript-role {
       font-size: 11px;
       font-weight: 600;
       text-transform: uppercase;
-      margin-bottom: 6px;
-      color: var(--text-dim);
+      letter-spacing: 0.5px;
+      padding: 3px 8px;
+      border-radius: 4px;
     }
 
-    .transcript-role.user { color: var(--accent); }
-    .transcript-role.assistant { color: var(--green); }
+    .transcript-role.user {
+      color: var(--accent);
+      background: rgba(10, 132, 255, 0.15);
+    }
 
-    .transcript-content {
-      white-space: pre-wrap;
-      word-break: break-word;
-      line-height: 1.5;
-      max-height: 200px;
-      overflow-y: auto;
+    .transcript-role.assistant {
+      color: var(--green);
+      background: rgba(48, 209, 88, 0.15);
     }
 
     .transcript-time {
       font-size: 10px;
       color: var(--text-dim);
-      margin-top: 6px;
+    }
+
+    .transcript-content {
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.5;
+      max-height: 150px;
+      overflow-y: auto;
+      font-size: 13px;
+      color: var(--text-secondary);
     }
 
     /* Result card */
@@ -1036,40 +1282,71 @@ class PromptShaperPanel {
       background: var(--bg-secondary);
       border: 1px solid var(--border);
       border-radius: var(--radius-lg);
-      padding: 16px;
+      padding: 18px;
+      box-shadow: var(--shadow-sm);
+      animation: messageIn 0.3s ease-out;
     }
 
     .result-header {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 12px;
+      margin-bottom: 14px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
     }
 
     .result-title {
       font-weight: 600;
-      font-size: 14px;
+      font-size: 15px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .result-title::before {
+      content: '✨';
     }
 
     .result-content {
       background: var(--bg);
-      padding: 12px;
+      padding: 14px 16px;
       border-radius: var(--radius);
       white-space: pre-wrap;
-      font-family: 'SF Mono', Monaco, monospace;
+      font-family: 'SF Mono', 'Fira Code', Monaco, monospace;
       font-size: 12px;
-      line-height: 1.5;
-      max-height: 250px;
+      line-height: 1.6;
+      max-height: 280px;
       overflow-y: auto;
+      border: 1px solid var(--border);
+    }
+
+    .meta-section {
+      margin-top: 14px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+    }
+
+    .meta-section-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
     }
 
     .meta-list {
-      margin-top: 12px;
-      padding-left: 20px;
-      color: var(--text-dim);
+      padding-left: 18px;
+      color: var(--text-secondary);
+      font-size: 12px;
     }
 
-    .meta-list li { margin: 4px 0; }
+    .meta-list li {
+      margin: 6px 0;
+      line-height: 1.4;
+    }
 
     /* Empty state */
     .empty-state {
@@ -1080,61 +1357,108 @@ class PromptShaperPanel {
       height: 100%;
       color: var(--text-dim);
       text-align: center;
-      gap: 8px;
+      gap: 12px;
+      padding: 40px;
     }
 
     .empty-icon {
-      font-size: 32px;
-      opacity: 0.5;
+      font-size: 48px;
+      opacity: 0.6;
+      margin-bottom: 8px;
     }
 
-    /* Loading */
-    .loading {
-      display: flex;
-      align-items: center;
-      gap: 8px;
+    .empty-title {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text-secondary);
+    }
+
+    .empty-subtitle {
+      font-size: 13px;
       color: var(--text-dim);
-      padding: 12px;
+      max-width: 280px;
+      line-height: 1.5;
     }
 
-    .spinner {
-      width: 14px;
-      height: 14px;
-      border: 2px solid var(--border);
-      border-top-color: var(--accent);
-      border-radius: 50%;
-      animation: spin 1s linear infinite;
+    /* Loading state in messages */
+    .loading-inline {
+      display: none;
+      padding: 16px;
     }
 
-    @keyframes spin { to { transform: rotate(360deg); } }
+    .loading-inline.active {
+      display: block;
+    }
 
     /* Error */
     .error {
-      background: rgba(239, 68, 68, 0.1);
-      border: 1px solid var(--red);
+      background: rgba(255, 69, 58, 0.1);
+      border: 1px solid rgba(255, 69, 58, 0.3);
       color: var(--red);
-      padding: 12px;
+      padding: 14px 16px;
       border-radius: var(--radius);
-      font-size: 12px;
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      animation: messageIn 0.3s ease-out;
     }
 
-    /* Scrollbar */
-    ::-webkit-scrollbar { width: 6px; }
-    ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb {
-      background: var(--border);
-      border-radius: 3px;
+    .error::before {
+      content: '⚠️';
     }
-    ::-webkit-scrollbar-thumb:hover { background: #444; }
+
+    /* Scrollbar - refined */
+    ::-webkit-scrollbar {
+      width: 8px;
+      height: 8px;
+    }
+
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: var(--bg-elevated);
+      border-radius: 4px;
+      border: 2px solid transparent;
+      background-clip: padding-box;
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+      background: var(--text-dim);
+      border: 2px solid transparent;
+      background-clip: padding-box;
+    }
+
+    /* Keyboard hint */
+    .keyboard-hint {
+      font-size: 10px;
+      color: var(--text-dim);
+      margin-top: 8px;
+      text-align: center;
+    }
+
+    kbd {
+      background: var(--bg-tertiary);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: inherit;
+      font-size: 10px;
+      border: 1px solid var(--border);
+    }
   </style>
 </head>
 <body>
   <div class="titlebar">
     <div class="titlebar-left">
-      <div class="status-dot ${this._isConnected ? '' : 'disconnected'}" id="status-dot" title="${this._isConnected ? 'Connected' : 'Disconnected'}"></div>
+      <div class="status-indicator" id="status-indicator" title="Click to refresh connection">
+        <div class="status-dot ${this._isConnected ? '' : 'disconnected'}"></div>
+        <span class="status-text">${this._isConnected ? 'Connected' : 'Disconnected'}</span>
+      </div>
       <span class="title">Claude Speak</span>
     </div>
-    <span class="workspace-badge">${escapeHtml(workspaceName)}</span>
+    <span class="workspace-badge" title="${escapeHtml(workspaceName)}">${escapeHtml(workspaceName)}</span>
   </div>
 
   <div class="tabs">
@@ -1149,73 +1473,96 @@ class PromptShaperPanel {
       <div class="panel" id="shaper-panel">
         <div class="empty-state" id="shaper-empty">
           <div class="empty-icon">✨</div>
-          <div>Transform your dictated thoughts into structured prompts</div>
+          <div class="empty-title">Prompt Shaper</div>
+          <div class="empty-subtitle">Transform your messy dictated thoughts into structured, send-ready prompts for Claude</div>
         </div>
         <div id="shaper-result" style="display: none;"></div>
-        <div id="shaper-loading" class="loading" style="display: none;">
-          <div class="spinner"></div>
-          <span>Shaping...</span>
+        <div id="shaper-loading" class="typing-indicator" style="display: none;">
+          <div class="typing-avatar">✨</div>
+          <div class="typing-bubble">
+            <div class="typing-dot"></div>
+            <div class="typing-dot"></div>
+            <div class="typing-dot"></div>
+          </div>
         </div>
       </div>
       <div class="input-area">
-        <div class="input-row">
-          <textarea id="shaper-input" placeholder="Paste your dictation here..." rows="2"></textarea>
-          <button id="shape-btn">Shape</button>
+        <div class="input-container">
+          <div class="input-row">
+            <textarea id="shaper-input" placeholder="Paste your dictation here..." rows="2"></textarea>
+            <button id="shape-btn">Shape</button>
+          </div>
         </div>
+        <div class="keyboard-hint"><kbd>⌘</kbd> + <kbd>Enter</kbd> to send</div>
       </div>
     </div>
 
     <!-- Meta Engineer Tab -->
     <div class="tab-content ${this._currentTab === 'meta' ? 'active' : ''}" id="meta-tab">
-      <div class="panel">
+      <div class="panel" id="meta-panel">
         <div class="messages" id="meta-messages">
           ${this._metaMessages.length === 0 ? `
             <div class="empty-state">
               <div class="empty-icon">🧠</div>
-              <div><strong>Meta Engineer</strong></div>
-              <div style="font-size: 12px;">Ask questions about your conversation without affecting the main chat</div>
+              <div class="empty-title">Meta Engineer</div>
+              <div class="empty-subtitle">A side-channel for reflecting on your conversation without affecting the main Claude Code chat</div>
             </div>
           ` : this._metaMessages.map(msg => `
             <div class="message ${msg.role}">
-              <div class="message-content">${escapeHtml(msg.content)}</div>
+              <div class="message-bubble">
+                <div class="message-content">${escapeHtml(msg.content)}</div>
+              </div>
+              <div class="message-time">${formatTime(msg.timestamp)}</div>
             </div>
           `).join('')}
         </div>
-        <div id="meta-loading" class="loading" style="display: none;">
-          <div class="spinner"></div>
-          <span>Thinking...</span>
+        <div id="meta-loading" class="typing-indicator" style="display: none;">
+          <div class="typing-avatar">🧠</div>
+          <div class="typing-bubble">
+            <div class="typing-dot"></div>
+            <div class="typing-dot"></div>
+            <div class="typing-dot"></div>
+          </div>
         </div>
       </div>
       <div class="input-area">
-        <div class="input-row">
-          <textarea id="meta-input" placeholder="Ask about your conversation..." rows="2"></textarea>
-          <button id="meta-btn">Ask</button>
-          <button id="clear-meta-btn" class="ghost small">Clear</button>
+        <div class="input-container">
+          <div class="input-row">
+            <textarea id="meta-input" placeholder="Ask about your conversation..." rows="2"></textarea>
+            <button id="meta-btn">Ask</button>
+            <button id="clear-meta-btn" class="ghost small">Clear</button>
+          </div>
         </div>
+        <div class="keyboard-hint"><kbd>⌘</kbd> + <kbd>Enter</kbd> to send</div>
       </div>
     </div>
 
     <!-- Transcript Tab -->
     <div class="tab-content ${this._currentTab === 'transcript' ? 'active' : ''}" id="transcript-tab">
       <div class="panel">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-          <span style="font-weight: 500;">Chat Transcript</span>
+        <div class="transcript-header">
+          <div class="transcript-title">
+            Chat Transcript
+            <span class="transcript-count">${this._transcript.length} messages</span>
+          </div>
           <button id="refresh-transcript-btn" class="ghost small">↻ Refresh</button>
         </div>
         <div id="transcript-container">
           ${this._transcript.length === 0 ? `
             <div class="empty-state">
               <div class="empty-icon">💬</div>
-              <div>No transcript available</div>
-              <div style="font-size: 11px; color: var(--text-dim);">Start a conversation with Claude Code to see it here</div>
+              <div class="empty-title">No Transcript</div>
+              <div class="empty-subtitle">Start a conversation with Claude Code to see it here</div>
             </div>
-          ` : this._transcript.map(msg => `
+          ` : `<div class="transcript-list">${this._transcript.map(msg => `
             <div class="transcript-item">
-              <div class="transcript-role ${msg.role}">${msg.role === 'user' ? 'You' : 'Claude'}</div>
+              <div class="transcript-item-header">
+                <span class="transcript-role ${msg.role}">${msg.role === 'user' ? 'You' : 'Claude'}</span>
+                ${msg.timestamp ? `<span class="transcript-time">${formatTimestamp(msg.timestamp)}</span>` : ''}
+              </div>
               <div class="transcript-content">${escapeHtml(msg.content)}</div>
-              ${msg.timestamp ? `<div class="transcript-time">${formatTimestamp(msg.timestamp)}</div>` : ''}
             </div>
-          `).join('')}
+          `).join('')}</div>`}
         </div>
       </div>
     </div>
@@ -1237,14 +1584,26 @@ class PromptShaperPanel {
     const shaperEmpty = document.getElementById('shaper-empty');
     const shaperResult = document.getElementById('shaper-result');
     const shaperLoading = document.getElementById('shaper-loading');
+    const shaperPanel = document.getElementById('shaper-panel');
 
     shapeBtn.addEventListener('click', () => {
       const text = shaperInput.value.trim();
-      if (text) vscode.postMessage({ command: 'shapePrompt', text });
+      if (text) {
+        vscode.postMessage({ command: 'shapePrompt', text });
+      }
     });
 
     shaperInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) shapeBtn.click();
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        shapeBtn.click();
+      }
+    });
+
+    // Auto-resize textarea
+    shaperInput.addEventListener('input', () => {
+      shaperInput.style.height = 'auto';
+      shaperInput.style.height = Math.min(shaperInput.scrollHeight, 120) + 'px';
     });
 
     // Meta Engineer
@@ -1253,17 +1612,27 @@ class PromptShaperPanel {
     const clearMetaBtn = document.getElementById('clear-meta-btn');
     const metaMessages = document.getElementById('meta-messages');
     const metaLoading = document.getElementById('meta-loading');
+    const metaPanel = document.getElementById('meta-panel');
 
     metaBtn.addEventListener('click', () => {
       const text = metaInput.value.trim();
       if (text) {
         metaInput.value = '';
+        metaInput.style.height = 'auto';
         vscode.postMessage({ command: 'metaQuery', text });
       }
     });
 
     metaInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) metaBtn.click();
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        metaBtn.click();
+      }
+    });
+
+    metaInput.addEventListener('input', () => {
+      metaInput.style.height = 'auto';
+      metaInput.style.height = Math.min(metaInput.scrollHeight, 120) + 'px';
     });
 
     clearMetaBtn.addEventListener('click', () => {
@@ -1276,51 +1645,60 @@ class PromptShaperPanel {
       vscode.postMessage({ command: 'refreshTranscript' });
     });
 
-    // Status dot click to refresh
-    document.getElementById('status-dot').addEventListener('click', () => {
+    // Status indicator click to refresh
+    document.getElementById('status-indicator')?.addEventListener('click', () => {
       vscode.postMessage({ command: 'refreshConnection' });
     });
 
-    // Handle messages
+    // Handle messages from extension
     window.addEventListener('message', event => {
       const message = event.data;
       switch (message.command) {
         case 'loading':
-          shaperLoading.style.display = message.loading ? 'flex' : 'none';
-          metaLoading.style.display = message.loading ? 'flex' : 'none';
-          shapeBtn.disabled = message.loading;
-          metaBtn.disabled = message.loading;
+          if (shaperLoading) shaperLoading.style.display = message.loading ? 'flex' : 'none';
+          if (metaLoading) metaLoading.style.display = message.loading ? 'flex' : 'none';
+          if (shapeBtn) shapeBtn.disabled = message.loading;
+          if (metaBtn) metaBtn.disabled = message.loading;
+          // Scroll to show loading indicator
+          if (message.loading) {
+            if (shaperPanel) shaperPanel.scrollTop = shaperPanel.scrollHeight;
+            if (metaPanel) metaPanel.scrollTop = metaPanel.scrollHeight;
+          }
           break;
         case 'shapeResult':
-          shaperEmpty.style.display = 'none';
-          shaperResult.style.display = 'block';
-          shaperResult.innerHTML = \`
-            <div class="result-card">
-              <div class="result-header">
-                <span class="result-title">\${escapeHtml(message.result.title)}</span>
-                <button class="small" onclick="copyResult()">Copy</button>
+          if (shaperEmpty) shaperEmpty.style.display = 'none';
+          if (shaperResult) {
+            shaperResult.style.display = 'block';
+            shaperResult.innerHTML = \`
+              <div class="result-card">
+                <div class="result-header">
+                  <span class="result-title">\${escapeHtml(message.result.title)}</span>
+                  <button class="small" onclick="copyResult()">Copy</button>
+                </div>
+                <div class="result-content" id="shaped-prompt">\${escapeHtml(message.result.send_to_claude)}</div>
+                \${message.result.assumptions.length > 0 ? \`
+                  <div class="meta-section">
+                    <div class="meta-section-title">💡 Assumptions</div>
+                    <ul class="meta-list">\${message.result.assumptions.map(a => \`<li>\${escapeHtml(a)}</li>\`).join('')}</ul>
+                  </div>
+                \` : ''}
+                \${message.result.questions.length > 0 ? \`
+                  <div class="meta-section">
+                    <div class="meta-section-title">❓ Questions to clarify</div>
+                    <ul class="meta-list">\${message.result.questions.map(q => \`<li>\${escapeHtml(q)}</li>\`).join('')}</ul>
+                  </div>
+                \` : ''}
               </div>
-              <div class="result-content" id="shaped-prompt">\${escapeHtml(message.result.send_to_claude)}</div>
-              \${message.result.assumptions.length > 0 ? \`
-                <div style="margin-top: 12px; font-size: 12px;">
-                  <strong>Assumptions:</strong>
-                  <ul class="meta-list">\${message.result.assumptions.map(a => \`<li>\${escapeHtml(a)}</li>\`).join('')}</ul>
-                </div>
-              \` : ''}
-              \${message.result.questions.length > 0 ? \`
-                <div style="margin-top: 12px; font-size: 12px;">
-                  <strong>Questions:</strong>
-                  <ul class="meta-list">\${message.result.questions.map(q => \`<li>\${escapeHtml(q)}</li>\`).join('')}</ul>
-                </div>
-              \` : ''}
-            </div>
-          \`;
-          shaperInput.value = '';
+            \`;
+          }
+          if (shaperInput) shaperInput.value = '';
           break;
         case 'error':
-          shaperEmpty.style.display = 'none';
-          shaperResult.style.display = 'block';
-          shaperResult.innerHTML = \`<div class="error">\${escapeHtml(message.message)}</div>\`;
+          if (shaperEmpty) shaperEmpty.style.display = 'none';
+          if (shaperResult) {
+            shaperResult.style.display = 'block';
+            shaperResult.innerHTML = \`<div class="error">\${escapeHtml(message.message)}</div>\`;
+          }
           break;
       }
     });
@@ -1331,13 +1709,29 @@ class PromptShaperPanel {
     }
 
     function escapeHtml(text) {
+      if (!text) return '';
       const div = document.createElement('div');
       div.textContent = text;
       return div.innerHTML;
     }
 
-    // Scroll to bottom
-    if (metaMessages) metaMessages.scrollTop = metaMessages.scrollHeight;
+    // Scroll to bottom on load
+    function scrollToBottom() {
+      if (metaPanel) {
+        metaPanel.scrollTop = metaPanel.scrollHeight;
+      }
+    }
+
+    // Initial scroll
+    scrollToBottom();
+
+    // Focus input based on active tab
+    const activeTab = document.querySelector('.tab.active');
+    if (activeTab?.dataset.tab === 'shaper' && shaperInput) {
+      shaperInput.focus();
+    } else if (activeTab?.dataset.tab === 'meta' && metaInput) {
+      metaInput.focus();
+    }
   </script>
 </body>
 </html>`;
@@ -1367,6 +1761,15 @@ function escapeHtml(text: string): string {
 }
 
 function formatTimestamp(ts: string): string {
+  try {
+    const date = new Date(ts);
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  } catch {
+    return '';
+  }
+}
+
+function formatTime(ts: number): string {
   try {
     const date = new Date(ts);
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
