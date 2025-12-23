@@ -17,6 +17,10 @@
       {
         "command": "promptShaper.dictateAndShape",
         "title": "Prompt Shaper: Dictate → Shape → Copy"
+      },
+      {
+        "command": "promptShaper.openPanel",
+        "title": "Prompt Shaper: Open Panel"
       }
     ],
     "configuration": {
