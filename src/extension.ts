@@ -1810,6 +1810,106 @@ function buildPayload(
 }
 
 // ============================================================================
+// Quick Popup Shape Command
+// ============================================================================
+
+async function quickDictateAndShape(): Promise<void> {
+  const workspaceRoot = getActiveWorkspaceRoot();
+  if (!workspaceRoot) {
+    vscode.window.showErrorMessage('No workspace folder open.');
+    return;
+  }
+
+  if (!isClaudeCliInstalled()) {
+    vscode.window.showErrorMessage('Claude CLI not found. Please install it first.');
+    return;
+  }
+
+  // Get dictation from user
+  const dictation = await vscode.window.showInputBox({
+    prompt: 'Paste your dictated text',
+    placeHolder: 'Enter your messy dictation here...',
+    ignoreFocusOut: true,
+  });
+
+  if (!dictation || !dictation.trim()) {
+    return;
+  }
+
+  // Show progress
+  await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: 'Shaping your prompt...',
+      cancellable: false,
+    },
+    async () => {
+      try {
+        const config = getConfig();
+        const sessionFile = await findBestSessionFile(workspaceRoot);
+        let assistantMessages: string[] = [];
+        let userMessages: string[] = [];
+
+        if (sessionFile) {
+          try {
+            const content = await tailReadFile(sessionFile, config.maxTailBytes);
+            const messages = parseJsonlMessages(content);
+            const extracted = extractRecentMessages(messages, config.maxAssistantMessages, config.maxUserMessages);
+            assistantMessages = extracted.assistantMessages;
+            userMessages = extracted.userMessages;
+          } catch { /* ignore */ }
+        }
+
+        const payload = buildPayload(workspaceRoot, assistantMessages, userMessages, dictation);
+        const rawOutput = await invokeClaudeCli(payload, SYSTEM_PROMPT);
+        const shaped = parseShapeOutput(rawOutput);
+
+        // Show result in quick pick
+        const action = await vscode.window.showQuickPick(
+          [
+            { label: '$(clippy) Copy to Clipboard', action: 'copy' },
+            { label: '$(eye) View Full Result', action: 'view' },
+            { label: '$(close) Dismiss', action: 'dismiss' },
+          ],
+          {
+            title: `✨ ${shaped.title}`,
+            placeHolder: shaped.send_to_claude.slice(0, 100) + '...',
+          }
+        );
+
+        if (action?.action === 'copy') {
+          await vscode.env.clipboard.writeText(shaped.send_to_claude);
+          vscode.window.showInformationMessage('Shaped prompt copied to clipboard!');
+        } else if (action?.action === 'view') {
+          // Show in output channel
+          const channel = vscode.window.createOutputChannel('Claude Speak');
+          channel.clear();
+          channel.appendLine(`✨ ${shaped.title}`);
+          channel.appendLine('─'.repeat(50));
+          channel.appendLine('');
+          channel.appendLine('SHAPED PROMPT:');
+          channel.appendLine(shaped.send_to_claude);
+          if (shaped.assumptions.length > 0) {
+            channel.appendLine('');
+            channel.appendLine('ASSUMPTIONS:');
+            shaped.assumptions.forEach(a => channel.appendLine(`• ${a}`));
+          }
+          if (shaped.questions.length > 0) {
+            channel.appendLine('');
+            channel.appendLine('QUESTIONS TO CLARIFY:');
+            shaped.questions.forEach(q => channel.appendLine(`• ${q}`));
+          }
+          channel.show();
+        }
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        vscode.window.showErrorMessage(`Claude Speak failed: ${errorMsg}`);
+      }
+    }
+  );
+}
+
+// ============================================================================
 // Extension Lifecycle
 // ============================================================================
 
@@ -1819,7 +1919,12 @@ export function activate(context: vscode.ExtensionContext): void {
     () => PromptShaperPanel.createOrShow(context.extensionUri)
   );
 
-  context.subscriptions.push(openPanelCommand);
+  const quickShapeCommand = vscode.commands.registerCommand(
+    'promptShaper.dictateAndShape',
+    quickDictateAndShape
+  );
+
+  context.subscriptions.push(openPanelCommand, quickShapeCommand);
   console.log('Claude Speak extension activated');
 }
 

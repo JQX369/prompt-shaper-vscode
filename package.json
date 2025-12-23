@@ -17,6 +17,10 @@
       {
         "command": "promptShaper.openPanel",
         "title": "Claude Speak: Open Panel"
+      },
+      {
+        "command": "promptShaper.dictateAndShape",
+        "title": "Claude Speak: Quick Shape (Popup)"
       }
     ],
     "configuration": {
