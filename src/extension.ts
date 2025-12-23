@@ -92,7 +92,9 @@ function getClaudeProjectsPath(): string {
 }
 
 function encodeWorkspacePath(workspacePath: string): string {
-  return workspacePath.replace(/\//g, '-').replace(/^-/, '');
+  // Claude Code encodes paths like: /Users/jqx/Desktop/foo -> -Users-jqx-Desktop-foo
+  // Replace all / with - and keep leading -
+  return workspacePath.replace(/\//g, '-');
 }
 
 async function findAllJsonlFiles(dir: string): Promise<{ path: string; mtime: Date }[]> {
@@ -132,29 +134,47 @@ async function findBestSessionFile(workspaceRoot: string): Promise<string | null
     return null;
   }
 
+  // Claude Code directory format: -Users-jqx-Desktop-project-name
+  const encodedPath = encodeWorkspacePath(workspaceRoot);
+  const exactDir = path.join(projectsPath, encodedPath);
+
+  // First, try exact directory match for this workspace
+  if (fs.existsSync(exactDir)) {
+    const filesInDir = await findJsonlFilesInDir(exactDir);
+    if (filesInDir.length > 0) {
+      // Sort by mtime descending, return newest
+      filesInDir.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+      console.log(`Prompt Shaper: Found exact workspace match: ${exactDir}`);
+      console.log(`Prompt Shaper: Using session file: ${filesInDir[0].path}`);
+      return filesInDir[0].path;
+    }
+  }
+
+  // Fall back to searching all directories
   const allJsonlFiles = await findAllJsonlFiles(projectsPath);
 
   if (allJsonlFiles.length === 0) {
     return null;
   }
 
-  const encodedPath = encodeWorkspacePath(workspaceRoot);
-  const workspaceBasename = path.basename(workspaceRoot);
+  const workspaceBasename = path.basename(workspaceRoot).toLowerCase();
 
   const scored = allJsonlFiles.map(file => {
     let score = 0;
     const filePath = file.path.toLowerCase();
     const encodedLower = encodedPath.toLowerCase();
-    const basenameLower = workspaceBasename.toLowerCase();
 
+    // Exact path match in directory name
     if (filePath.includes(encodedLower)) {
       score += 100;
     }
 
-    if (filePath.includes(basenameLower)) {
+    // Workspace folder name match
+    if (filePath.includes(workspaceBasename)) {
       score += 50;
     }
 
+    // Recency bonus
     const ageMs = Date.now() - file.mtime.getTime();
     const ageHours = ageMs / (1000 * 60 * 60);
     score += Math.max(0, 24 - ageHours);
@@ -167,7 +187,35 @@ async function findBestSessionFile(workspaceRoot: string): Promise<string | null
     return b.mtime.getTime() - a.mtime.getTime();
   });
 
+  if (scored[0]) {
+    console.log(`Prompt Shaper: Using fallback session file: ${scored[0].path}`);
+  }
+
   return scored[0]?.path || null;
+}
+
+async function findJsonlFilesInDir(dir: string): Promise<{ path: string; mtime: Date }[]> {
+  const results: { path: string; mtime: Date }[] = [];
+  try {
+    const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+        const fullPath = path.join(dir, entry.name);
+        try {
+          const stat = await fs.promises.stat(fullPath);
+          // Skip empty files
+          if (stat.size > 0) {
+            results.push({ path: fullPath, mtime: stat.mtime });
+          }
+        } catch {
+          // Skip files we can't stat
+        }
+      }
+    }
+  } catch {
+    // Directory read failed
+  }
+  return results;
 }
 
 // ============================================================================
@@ -210,21 +258,25 @@ function parseJsonlMessages(content: string): SessionMessage[] {
       let role: 'user' | 'assistant' | null = null;
       let msgContent: string | null = null;
 
-      if (obj.role === 'user' || obj.role === 'assistant') {
+      // Claude Code JSONL format (actual):
+      // { type: "user", message: { role: "user", content: [{ type: "text", text: "..." }] } }
+      // { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "..." }] } }
+
+      if (obj.type === 'user' && obj.message?.content) {
+        role = 'user';
+        msgContent = extractContent(obj.message.content);
+      }
+      else if (obj.type === 'assistant' && obj.message?.content) {
+        role = 'assistant';
+        msgContent = extractContent(obj.message.content);
+      }
+      // Fallback for other formats
+      else if (obj.role === 'user' || obj.role === 'assistant') {
         role = obj.role;
         msgContent = extractContent(obj.content);
       }
-      else if (obj.type === 'user' || obj.type === 'human') {
-        role = 'user';
-        msgContent = extractContent(obj.message || obj.content || obj.text);
-      }
-      else if (obj.type === 'assistant' || obj.type === 'ai') {
-        role = 'assistant';
-        msgContent = extractContent(obj.message || obj.content || obj.text);
-      }
-      else if (obj.message?.role) {
-        role = obj.message.role === 'user' || obj.message.role === 'human' ? 'user' :
-               obj.message.role === 'assistant' || obj.message.role === 'ai' ? 'assistant' : null;
+      else if (obj.message?.role === 'user' || obj.message?.role === 'assistant') {
+        role = obj.message.role;
         msgContent = extractContent(obj.message.content);
       }
 
@@ -244,18 +296,22 @@ function extractContent(value: unknown): string | null {
     return value;
   }
   if (Array.isArray(value)) {
-    return value
+    // Handle array of content blocks like [{ type: "text", text: "..." }]
+    const textParts = value
       .map(item => {
         if (typeof item === 'string') return item;
-        if (item?.text) return item.text;
-        if (item?.content) return item.content;
+        // Only extract text content, skip tool_use, tool_result, etc.
+        if (item?.type === 'text' && item?.text) return item.text;
+        if (item?.text && !item?.type) return item.text;
+        if (item?.content && typeof item.content === 'string') return item.content;
         return '';
       })
-      .filter(Boolean)
-      .join('\n');
+      .filter(Boolean);
+    return textParts.length > 0 ? textParts.join('\n') : null;
   }
   if (value && typeof value === 'object') {
     const obj = value as Record<string, unknown>;
+    if (obj.type === 'text' && obj.text) return String(obj.text);
     if (obj.text) return String(obj.text);
     if (obj.content) return extractContent(obj.content);
   }
