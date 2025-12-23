@@ -19,7 +19,7 @@ interface ShaperOutput {
 interface SessionMessage {
   role: 'user' | 'assistant';
   content: string;
-  timestamp?: number;
+  timestamp?: string;
 }
 
 interface ClaudeCliConfig {
@@ -32,6 +32,12 @@ interface MetaEngineerMessage {
   role: 'user' | 'assistant';
   content: string;
   timestamp: number;
+}
+
+interface TranscriptMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: string;
 }
 
 // ============================================================================
@@ -86,10 +92,6 @@ function getConfig() {
 // Active Workspace Detection
 // ============================================================================
 
-/**
- * Detects the workspace root based on the currently active editor/tab.
- * Falls back to first workspace folder if no active editor.
- */
 function getActiveWorkspaceRoot(): string | null {
   const workspaceFolders = vscode.workspace.workspaceFolders;
 
@@ -97,47 +99,27 @@ function getActiveWorkspaceRoot(): string | null {
     return null;
   }
 
-  // If only one workspace, use it
   if (workspaceFolders.length === 1) {
     return workspaceFolders[0].uri.fsPath;
   }
 
-  // Try to determine workspace from active editor
   const activeEditor = vscode.window.activeTextEditor;
   if (activeEditor) {
     const activeFile = activeEditor.document.uri;
     const workspaceFolder = vscode.workspace.getWorkspaceFolder(activeFile);
     if (workspaceFolder) {
-      console.log(`Prompt Shaper: Detected workspace from active file: ${workspaceFolder.uri.fsPath}`);
       return workspaceFolder.uri.fsPath;
     }
   }
 
-  // Try visible text editors
   for (const editor of vscode.window.visibleTextEditors) {
     const workspaceFolder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
     if (workspaceFolder) {
-      console.log(`Prompt Shaper: Detected workspace from visible editor: ${workspaceFolder.uri.fsPath}`);
       return workspaceFolder.uri.fsPath;
     }
   }
 
-  // Fall back to first workspace folder
-  console.log(`Prompt Shaper: Falling back to first workspace folder: ${workspaceFolders[0].uri.fsPath}`);
   return workspaceFolders[0].uri.fsPath;
-}
-
-/**
- * Gets info about the currently active context for display
- */
-function getActiveContextInfo(): { workspace: string; activeFile: string | null } {
-  const workspaceRoot = getActiveWorkspaceRoot();
-  const activeEditor = vscode.window.activeTextEditor;
-
-  return {
-    workspace: workspaceRoot || 'Unknown',
-    activeFile: activeEditor ? path.basename(activeEditor.document.uri.fsPath) : null,
-  };
 }
 
 // ============================================================================
@@ -150,9 +132,30 @@ function getClaudeProjectsPath(): string {
 }
 
 function encodeWorkspacePath(workspacePath: string): string {
-  // Claude Code encodes paths like: /Users/jqx/Desktop/foo -> -Users-jqx-Desktop-foo
-  // Replace all / with - and keep leading -
   return workspacePath.replace(/\//g, '-');
+}
+
+async function findJsonlFilesInDir(dir: string): Promise<{ path: string; mtime: Date }[]> {
+  const results: { path: string; mtime: Date }[] = [];
+  try {
+    const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isFile() && entry.name.endsWith('.jsonl') && !entry.name.startsWith('agent-')) {
+        const fullPath = path.join(dir, entry.name);
+        try {
+          const stat = await fs.promises.stat(fullPath);
+          if (stat.size > 0) {
+            results.push({ path: fullPath, mtime: stat.mtime });
+          }
+        } catch {
+          // Skip
+        }
+      }
+    }
+  } catch {
+    // Skip
+  }
+  return results;
 }
 
 async function findAllJsonlFiles(dir: string): Promise<{ path: string; mtime: Date }[]> {
@@ -170,12 +173,14 @@ async function findAllJsonlFiles(dir: string): Promise<{ path: string; mtime: Da
       const fullPath = path.join(currentDir, entry.name);
       if (entry.isDirectory()) {
         await walk(fullPath);
-      } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+      } else if (entry.isFile() && entry.name.endsWith('.jsonl') && !entry.name.startsWith('agent-')) {
         try {
           const stat = await fs.promises.stat(fullPath);
-          results.push({ path: fullPath, mtime: stat.mtime });
+          if (stat.size > 0) {
+            results.push({ path: fullPath, mtime: stat.mtime });
+          }
         } catch {
-          // Skip files we can't stat
+          // Skip
         }
       }
     }
@@ -192,23 +197,17 @@ async function findBestSessionFile(workspaceRoot: string): Promise<string | null
     return null;
   }
 
-  // Claude Code directory format: -Users-jqx-Desktop-project-name
   const encodedPath = encodeWorkspacePath(workspaceRoot);
   const exactDir = path.join(projectsPath, encodedPath);
 
-  // First, try exact directory match for this workspace
   if (fs.existsSync(exactDir)) {
     const filesInDir = await findJsonlFilesInDir(exactDir);
     if (filesInDir.length > 0) {
-      // Sort by mtime descending, return newest
       filesInDir.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
-      console.log(`Prompt Shaper: Found exact workspace match: ${exactDir}`);
-      console.log(`Prompt Shaper: Using session file: ${filesInDir[0].path}`);
       return filesInDir[0].path;
     }
   }
 
-  // Fall back to searching all directories
   const allJsonlFiles = await findAllJsonlFiles(projectsPath);
 
   if (allJsonlFiles.length === 0) {
@@ -222,17 +221,14 @@ async function findBestSessionFile(workspaceRoot: string): Promise<string | null
     const filePath = file.path.toLowerCase();
     const encodedLower = encodedPath.toLowerCase();
 
-    // Exact path match in directory name
     if (filePath.includes(encodedLower)) {
       score += 100;
     }
 
-    // Workspace folder name match
     if (filePath.includes(workspaceBasename)) {
       score += 50;
     }
 
-    // Recency bonus
     const ageMs = Date.now() - file.mtime.getTime();
     const ageHours = ageMs / (1000 * 60 * 60);
     score += Math.max(0, 24 - ageHours);
@@ -245,40 +241,16 @@ async function findBestSessionFile(workspaceRoot: string): Promise<string | null
     return b.mtime.getTime() - a.mtime.getTime();
   });
 
-  if (scored[0]) {
-    console.log(`Prompt Shaper: Using fallback session file: ${scored[0].path}`);
-  }
-
   return scored[0]?.path || null;
 }
 
-async function findJsonlFilesInDir(dir: string): Promise<{ path: string; mtime: Date }[]> {
-  const results: { path: string; mtime: Date }[] = [];
-  try {
-    const entries = await fs.promises.readdir(dir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (entry.isFile() && entry.name.endsWith('.jsonl')) {
-        const fullPath = path.join(dir, entry.name);
-        try {
-          const stat = await fs.promises.stat(fullPath);
-          // Skip empty files
-          if (stat.size > 0) {
-            results.push({ path: fullPath, mtime: stat.mtime });
-          }
-        } catch {
-          // Skip files we can't stat
-        }
-      }
-    }
-  } catch {
-    // Directory read failed
-  }
-  return results;
-}
+// ============================================================================
+// Session Log Parsing
+// ============================================================================
 
-// ============================================================================
-// Session Log Parsing (Tail-Read)
-// ============================================================================
+async function readFullFile(filePath: string): Promise<string> {
+  return fs.promises.readFile(filePath, 'utf-8');
+}
 
 async function tailReadFile(filePath: string, maxBytes: number): Promise<string> {
   const stat = await fs.promises.stat(filePath);
@@ -315,34 +287,34 @@ function parseJsonlMessages(content: string): SessionMessage[] {
 
       let role: 'user' | 'assistant' | null = null;
       let msgContent: string | null = null;
-
-      // Claude Code JSONL format (actual):
-      // { type: "user", message: { role: "user", content: [{ type: "text", text: "..." }] } }
-      // { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "..." }] } }
+      let timestamp: string | undefined;
 
       if (obj.type === 'user' && obj.message?.content) {
         role = 'user';
         msgContent = extractContent(obj.message.content);
+        timestamp = obj.timestamp;
       }
       else if (obj.type === 'assistant' && obj.message?.content) {
         role = 'assistant';
         msgContent = extractContent(obj.message.content);
+        timestamp = obj.timestamp;
       }
-      // Fallback for other formats
       else if (obj.role === 'user' || obj.role === 'assistant') {
         role = obj.role;
         msgContent = extractContent(obj.content);
+        timestamp = obj.timestamp;
       }
       else if (obj.message?.role === 'user' || obj.message?.role === 'assistant') {
         role = obj.message.role;
         msgContent = extractContent(obj.message.content);
+        timestamp = obj.timestamp;
       }
 
       if (role && msgContent && msgContent.trim()) {
-        messages.push({ role, content: msgContent.trim() });
+        messages.push({ role, content: msgContent.trim(), timestamp });
       }
     } catch {
-      // Skip unparseable lines
+      // Skip
     }
   }
 
@@ -354,11 +326,9 @@ function extractContent(value: unknown): string | null {
     return value;
   }
   if (Array.isArray(value)) {
-    // Handle array of content blocks like [{ type: "text", text: "..." }]
     const textParts = value
       .map(item => {
         if (typeof item === 'string') return item;
-        // Only extract text content, skip tool_use, tool_result, etc.
         if (item?.type === 'text' && item?.text) return item.text;
         if (item?.text && !item?.type) return item.text;
         if (item?.content && typeof item.content === 'string') return item.content;
@@ -412,66 +382,10 @@ function detectClaudeCliConfig(): ClaudeCliConfig {
   }
 
   const config: ClaudeCliConfig = {
-    printFlag: null,
-    systemPromptFlag: null,
+    printFlag: '-p',
+    systemPromptFlag: '--system-prompt',
     systemPromptEnv: null,
   };
-
-  try {
-    let helpOutput = '';
-    try {
-      helpOutput = execSync('claude --help 2>&1', {
-        encoding: 'utf-8',
-        timeout: 10000,
-      });
-    } catch (e: unknown) {
-      if (e && typeof e === 'object' && 'stdout' in e) {
-        helpOutput = String((e as { stdout: unknown }).stdout || '');
-      }
-    }
-
-    if (!helpOutput) {
-      try {
-        helpOutput = execSync('claude -h 2>&1', {
-          encoding: 'utf-8',
-          timeout: 10000,
-        });
-      } catch (e: unknown) {
-        if (e && typeof e === 'object' && 'stdout' in e) {
-          helpOutput = String((e as { stdout: unknown }).stdout || '');
-        }
-      }
-    }
-
-    const helpLower = helpOutput.toLowerCase();
-
-    if (helpLower.includes('-p') && (helpLower.includes('print') || helpLower.includes('prompt') || helpLower.includes('non-interactive'))) {
-      config.printFlag = '-p';
-    } else if (helpLower.includes('--print')) {
-      config.printFlag = '--print';
-    } else if (helpLower.includes('--prompt')) {
-      config.printFlag = '--prompt';
-    } else if (helpLower.includes('--non-interactive')) {
-      config.printFlag = '--non-interactive';
-    } else {
-      config.printFlag = '-p';
-    }
-
-    if (helpLower.includes('--system-prompt')) {
-      config.systemPromptFlag = '--system-prompt';
-    } else if (helpLower.includes('--system')) {
-      config.systemPromptFlag = '--system';
-    } else if (helpLower.includes('-s') && helpLower.includes('system')) {
-      config.systemPromptFlag = '-s';
-    }
-
-    if (helpLower.includes('claude_system_prompt') || helpLower.includes('system_prompt')) {
-      config.systemPromptEnv = 'CLAUDE_SYSTEM_PROMPT';
-    }
-
-  } catch {
-    config.printFlag = '-p';
-  }
 
   cachedCliConfig = config;
   return config;
@@ -509,13 +423,8 @@ async function invokeClaudeCli(payload: string, systemPrompt: string): Promise<s
     if (cliConfig.systemPromptFlag) {
       args.push(cliConfig.systemPromptFlag, systemPrompt);
       args.push(payload);
-    }
-    else if (cliConfig.systemPromptEnv) {
-      env[cliConfig.systemPromptEnv] = systemPrompt;
-      args.push(payload);
-    }
-    else {
-      const combinedPayload = `[SYSTEM INSTRUCTIONS]\n${systemPrompt}\n\n[USER REQUEST]\n${payload}`;
+    } else {
+      const combinedPayload = `[SYSTEM]\n${systemPrompt}\n\n[USER]\n${payload}`;
       args.push(combinedPayload);
     }
 
@@ -542,9 +451,7 @@ async function invokeClaudeCli(payload: string, systemPrompt: string): Promise<s
     });
 
     proc.on('close', (code) => {
-      if (timedOut) {
-        return;
-      }
+      if (timedOut) return;
       if (code === 0 || stdout.trim()) {
         resolve(stdout);
       } else {
@@ -556,23 +463,17 @@ async function invokeClaudeCli(payload: string, systemPrompt: string): Promise<s
       timedOut = true;
       proc.kill('SIGTERM');
       setTimeout(() => {
-        try {
-          proc.kill('SIGKILL');
-        } catch {
-          // Already dead
-        }
+        try { proc.kill('SIGKILL'); } catch { /* */ }
       }, 1000);
-      reject(new Error('Claude CLI timed out after 120 seconds. The model may be slow or unresponsive.'));
+      reject(new Error('Claude CLI timed out after 120 seconds.'));
     }, 120000);
 
-    proc.on('close', () => {
-      clearTimeout(timeout);
-    });
+    proc.on('close', () => clearTimeout(timeout));
   });
 }
 
 // ============================================================================
-// JSON Parsing (Robust)
+// JSON Parsing
 // ============================================================================
 
 function parseShapeOutput(raw: string): ShaperOutput {
@@ -582,9 +483,7 @@ function parseShapeOutput(raw: string): ShaperOutput {
 
   for (let i = 0; i < raw.length; i++) {
     if (raw[i] === '{') {
-      if (depth === 0) {
-        start = i;
-      }
+      if (depth === 0) start = i;
       depth++;
     } else if (raw[i] === '}') {
       depth--;
@@ -603,7 +502,7 @@ function parseShapeOutput(raw: string): ShaperOutput {
   const parsed = JSON.parse(jsonStr);
 
   if (typeof parsed.send_to_claude !== 'string') {
-    throw new Error('Missing or invalid send_to_claude field');
+    throw new Error('Missing send_to_claude field');
   }
 
   return {
@@ -616,229 +515,32 @@ function parseShapeOutput(raw: string): ShaperOutput {
 }
 
 // ============================================================================
-// Dictate and Shape Command
+// Main Panel
 // ============================================================================
 
-async function dictateAndShape(): Promise<void> {
-  const workspaceRoot = getActiveWorkspaceRoot();
-  if (!workspaceRoot) {
-    vscode.window.showErrorMessage(
-      'Prompt Shaper: No workspace folder open. Please open a folder first.'
-    );
-    return;
-  }
-
-  // Log what we detected
-  const contextInfo = getActiveContextInfo();
-  console.log(`Prompt Shaper: Active workspace: ${contextInfo.workspace}`);
-  console.log(`Prompt Shaper: Active file: ${contextInfo.activeFile || 'none'}`);
-
-
-  const projectsPath = getClaudeProjectsPath();
-  if (!fs.existsSync(projectsPath)) {
-    const platform = os.platform();
-    if (platform !== 'darwin') {
-      vscode.window.showErrorMessage(
-        `Prompt Shaper: Claude Code projects directory not found at ${projectsPath}. ` +
-        `This extension is optimized for macOS. On ${platform}, Claude Code may store logs elsewhere.`
-      );
-    } else {
-      vscode.window.showErrorMessage(
-        `Prompt Shaper: Claude Code projects directory not found at ${projectsPath}. ` +
-        'Please run Claude Code at least once to generate session logs.'
-      );
-    }
-    return;
-  }
-
-  if (!isClaudeCliInstalled()) {
-    vscode.window.showErrorMessage(
-      'Prompt Shaper: Claude CLI not found on PATH. ' +
-      'Please install Claude Code CLI: https://docs.anthropic.com/en/docs/claude-code'
-    );
-    return;
-  }
-
-  const dictation = await vscode.window.showInputBox({
-    title: 'Prompt Shaper',
-    prompt: 'Paste your dictated text here (use OS dictation, then paste)',
-    placeHolder: 'I want to add a feature that does...',
-    ignoreFocusOut: true,
-  });
-
-  if (!dictation || !dictation.trim()) {
-    return;
-  }
-
-  await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: 'Prompt Shaper',
-      cancellable: false,
-    },
-    async (progress) => {
-      progress.report({ message: 'Finding session context...' });
-
-      const config = getConfig();
-
-      const sessionFile = await findBestSessionFile(workspaceRoot);
-      let assistantMessages: string[] = [];
-      let userMessages: string[] = [];
-
-      if (sessionFile) {
-        try {
-          const content = await tailReadFile(sessionFile, config.maxTailBytes);
-          const messages = parseJsonlMessages(content);
-          const extracted = extractRecentMessages(
-            messages,
-            config.maxAssistantMessages,
-            config.maxUserMessages
-          );
-          assistantMessages = extracted.assistantMessages;
-          userMessages = extracted.userMessages;
-        } catch (err) {
-          console.warn('Prompt Shaper: Failed to read session file:', err);
-        }
-      }
-
-      progress.report({ message: 'Shaping prompt with Claude...' });
-
-      const payload = buildPayload(workspaceRoot, assistantMessages, userMessages, dictation);
-
-      let rawOutput: string;
-      try {
-        rawOutput = await invokeClaudeCli(payload, SYSTEM_PROMPT);
-      } catch (err) {
-        const errorMsg = err instanceof Error ? err.message : String(err);
-        vscode.window.showErrorMessage(
-          `Prompt Shaper: Claude CLI failed. ${errorMsg}\n\n` +
-          'Make sure you are logged in: run "claude" in terminal first.'
-        );
-        return;
-      }
-
-      let shaped: ShaperOutput;
-      try {
-        shaped = parseShapeOutput(rawOutput);
-      } catch (err) {
-        const errorMsg = err instanceof Error ? err.message : String(err);
-        console.error('Prompt Shaper raw output:', rawOutput);
-        vscode.window.showErrorMessage(
-          `Prompt Shaper: Failed to parse Claude output. ${errorMsg}\n\n` +
-          'Check Output panel (Prompt Shaper) for raw response.'
-        );
-
-        const channel = vscode.window.createOutputChannel('Prompt Shaper');
-        channel.appendLine('=== Raw Claude Output ===');
-        channel.appendLine(rawOutput);
-        channel.show();
-        return;
-      }
-
-      await vscode.env.clipboard.writeText(shaped.send_to_claude);
-
-      let notification = `Shaped prompt copied to clipboard!`;
-      if (shaped.questions.length > 0) {
-        notification += ` (${shaped.questions.length} clarifying question${shaped.questions.length > 1 ? 's' : ''} included)`;
-      }
-
-      vscode.window.showInformationMessage(notification);
-
-      if (shaped.questions.length > 0 || shaped.assumptions.length > 0) {
-        const channel = vscode.window.createOutputChannel('Prompt Shaper');
-        channel.clear();
-        channel.appendLine(`=== ${shaped.title} ===`);
-        channel.appendLine('');
-        channel.appendLine('--- SEND TO CLAUDE ---');
-        channel.appendLine(shaped.send_to_claude);
-
-        if (shaped.assumptions.length > 0) {
-          channel.appendLine('');
-          channel.appendLine('--- ASSUMPTIONS ---');
-          shaped.assumptions.forEach((a, i) => channel.appendLine(`${i + 1}. ${a}`));
-        }
-
-        if (shaped.questions.length > 0) {
-          channel.appendLine('');
-          channel.appendLine('--- QUESTIONS (needs clarification) ---');
-          shaped.questions.forEach((q, i) => channel.appendLine(`${i + 1}. ${q}`));
-        }
-
-        channel.appendLine('');
-        channel.appendLine('--- ORIGINAL DICTATION ---');
-        channel.appendLine(shaped.verbatim);
-      }
-    }
-  );
-}
-
-function buildPayload(
-  workspace: string,
-  assistantMessages: string[],
-  userMessages: string[],
-  dictation: string
-): string {
-  const sections: string[] = [];
-
-  sections.push(`WORKSPACE: ${workspace}`);
-  sections.push('');
-
-  if (assistantMessages.length > 0) {
-    sections.push('RECENT_ASSISTANT_MESSAGES (oldest to newest):');
-    assistantMessages.forEach((msg, i) => {
-      const truncated = msg.length > 2000 ? msg.slice(0, 2000) + '...[truncated]' : msg;
-      sections.push(`[${i + 1}] ${truncated}`);
-      sections.push('');
-    });
-  } else {
-    sections.push('RECENT_ASSISTANT_MESSAGES: (none available)');
-    sections.push('');
-  }
-
-  if (userMessages.length > 0) {
-    sections.push('RECENT_USER_MESSAGES (oldest to newest):');
-    userMessages.forEach((msg, i) => {
-      const truncated = msg.length > 1000 ? msg.slice(0, 1000) + '...[truncated]' : msg;
-      sections.push(`[${i + 1}] ${truncated}`);
-      sections.push('');
-    });
-  } else {
-    sections.push('RECENT_USER_MESSAGES: (none available)');
-    sections.push('');
-  }
-
-  sections.push('RAW_DICTATION:');
-  sections.push(dictation);
-
-  return sections.join('\n');
-}
-
-// ============================================================================
-// Meta Engineer Panel
-// ============================================================================
-
-class MetaEngineerPanel {
-  public static currentPanel: MetaEngineerPanel | undefined;
+class PromptShaperPanel {
+  public static currentPanel: PromptShaperPanel | undefined;
   private readonly _panel: vscode.WebviewPanel;
   private readonly _extensionUri: vscode.Uri;
   private _disposables: vscode.Disposable[] = [];
-  private _messages: MetaEngineerMessage[] = [];
-  private _currentTab: 'shaper' | 'meta' = 'shaper';
+  private _metaMessages: MetaEngineerMessage[] = [];
+  private _currentTab: 'shaper' | 'meta' | 'transcript' = 'shaper';
+  private _transcript: TranscriptMessage[] = [];
+  private _isConnected: boolean = false;
+  private _sessionFile: string | null = null;
 
   public static createOrShow(extensionUri: vscode.Uri) {
-    const column = vscode.window.activeTextEditor
-      ? vscode.window.activeTextEditor.viewColumn
-      : undefined;
+    const column = vscode.ViewColumn.Beside;
 
-    if (MetaEngineerPanel.currentPanel) {
-      MetaEngineerPanel.currentPanel._panel.reveal(column);
+    if (PromptShaperPanel.currentPanel) {
+      PromptShaperPanel.currentPanel._panel.reveal(column);
       return;
     }
 
     const panel = vscode.window.createWebviewPanel(
-      'promptShaperPanel',
-      'Prompt Shaper',
-      column || vscode.ViewColumn.One,
+      'claudeSpeak',
+      'Claude Speak',
+      column,
       {
         enableScripts: true,
         retainContextWhenHidden: true,
@@ -846,13 +548,14 @@ class MetaEngineerPanel {
       }
     );
 
-    MetaEngineerPanel.currentPanel = new MetaEngineerPanel(panel, extensionUri);
+    PromptShaperPanel.currentPanel = new PromptShaperPanel(panel, extensionUri);
   }
 
   private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri) {
     this._panel = panel;
     this._extensionUri = extensionUri;
 
+    this._initializeSession();
     this._update();
 
     this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
@@ -862,6 +565,9 @@ class MetaEngineerPanel {
         switch (message.command) {
           case 'switchTab':
             this._currentTab = message.tab;
+            if (message.tab === 'transcript') {
+              await this._loadTranscript();
+            }
             this._update();
             break;
           case 'shapePrompt':
@@ -875,11 +581,16 @@ class MetaEngineerPanel {
             vscode.window.showInformationMessage('Copied to clipboard!');
             break;
           case 'clearMetaHistory':
-            this._messages = [];
+            this._metaMessages = [];
             this._update();
             break;
-          case 'refreshContext':
-            this._refreshContext();
+          case 'refreshTranscript':
+            await this._loadTranscript();
+            this._update();
+            break;
+          case 'refreshConnection':
+            await this._initializeSession();
+            this._update();
             break;
         }
       },
@@ -888,53 +599,55 @@ class MetaEngineerPanel {
     );
   }
 
-  private async _refreshContext() {
+  private async _initializeSession() {
     const workspaceRoot = getActiveWorkspaceRoot();
-    const contextInfo = getActiveContextInfo();
-
     if (!workspaceRoot) {
-      this._panel.webview.postMessage({
-        command: 'contextUpdate',
-        workspace: 'No workspace',
-        status: 'error',
-        statusText: 'No workspace open',
-      });
+      this._isConnected = false;
+      this._sessionFile = null;
       return;
     }
 
-    // Check if session file exists
+    this._sessionFile = await findBestSessionFile(workspaceRoot);
+    this._isConnected = this._sessionFile !== null && isClaudeCliInstalled();
+  }
+
+  private async _loadTranscript() {
+    const workspaceRoot = getActiveWorkspaceRoot();
+    if (!workspaceRoot) {
+      this._transcript = [];
+      return;
+    }
+
     const sessionFile = await findBestSessionFile(workspaceRoot);
+    if (!sessionFile) {
+      this._transcript = [];
+      return;
+    }
 
-    this._panel.webview.postMessage({
-      command: 'contextUpdate',
-      workspace: path.basename(workspaceRoot),
-      status: sessionFile ? 'ok' : 'warning',
-      statusText: sessionFile ? `Session found` : 'No session found',
-    });
-
-    vscode.window.showInformationMessage(
-      `Context: ${path.basename(workspaceRoot)}${contextInfo.activeFile ? ` (${contextInfo.activeFile})` : ''}`
-    );
+    try {
+      const content = await readFullFile(sessionFile);
+      const messages = parseJsonlMessages(content);
+      this._transcript = messages.map(m => ({
+        role: m.role,
+        content: m.content,
+        timestamp: m.timestamp || '',
+      }));
+    } catch {
+      this._transcript = [];
+    }
   }
 
   private async _handleShapePrompt(dictation: string) {
-    if (!dictation.trim()) {
-      return;
-    }
+    if (!dictation.trim()) return;
 
     const workspaceRoot = getActiveWorkspaceRoot();
     if (!workspaceRoot) {
-      this._sendError('No workspace folder open. Please open a folder first.');
+      this._sendError('No workspace open.');
       return;
     }
 
-    // Log detected context
-    const contextInfo = getActiveContextInfo();
-    console.log(`Prompt Shaper Panel: Using workspace: ${contextInfo.workspace}`);
-    console.log(`Prompt Shaper Panel: Active file: ${contextInfo.activeFile || 'none'}`);
-
     if (!isClaudeCliInstalled()) {
-      this._sendError('Claude CLI not found on PATH. Please install Claude Code CLI.');
+      this._sendError('Claude CLI not found.');
       return;
     }
 
@@ -950,62 +663,40 @@ class MetaEngineerPanel {
         try {
           const content = await tailReadFile(sessionFile, config.maxTailBytes);
           const messages = parseJsonlMessages(content);
-          const extracted = extractRecentMessages(
-            messages,
-            config.maxAssistantMessages,
-            config.maxUserMessages
-          );
+          const extracted = extractRecentMessages(messages, config.maxAssistantMessages, config.maxUserMessages);
           assistantMessages = extracted.assistantMessages;
           userMessages = extracted.userMessages;
-        } catch (err) {
-          console.warn('Failed to read session file:', err);
-        }
+        } catch { /* */ }
       }
 
       const payload = buildPayload(workspaceRoot, assistantMessages, userMessages, dictation);
       const rawOutput = await invokeClaudeCli(payload, SYSTEM_PROMPT);
       const shaped = parseShapeOutput(rawOutput);
 
-      this._panel.webview.postMessage({
-        command: 'shapeResult',
-        result: shaped,
-      });
+      this._panel.webview.postMessage({ command: 'shapeResult', result: shaped });
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
-      this._sendError(`Failed to shape prompt: ${errorMsg}`);
+      this._sendError(`Failed: ${errorMsg}`);
     } finally {
       this._panel.webview.postMessage({ command: 'loading', loading: false });
     }
   }
 
   private async _handleMetaQuery(query: string) {
-    if (!query.trim()) {
-      return;
-    }
+    if (!query.trim()) return;
 
     const workspaceRoot = getActiveWorkspaceRoot();
     if (!workspaceRoot) {
-      this._sendError('No workspace folder open. Please open a folder first.');
+      this._sendError('No workspace open.');
       return;
     }
-
-    // Log detected context
-    const contextInfo = getActiveContextInfo();
-    console.log(`Meta Engineer: Using workspace: ${contextInfo.workspace}`);
-    console.log(`Meta Engineer: Active file: ${contextInfo.activeFile || 'none'}`);
 
     if (!isClaudeCliInstalled()) {
-      this._sendError('Claude CLI not found on PATH. Please install Claude Code CLI.');
+      this._sendError('Claude CLI not found.');
       return;
     }
 
-    // Add user message to history
-    this._messages.push({
-      role: 'user',
-      content: query,
-      timestamp: Date.now(),
-    });
-
+    this._metaMessages.push({ role: 'user', content: query, timestamp: Date.now() });
     this._panel.webview.postMessage({ command: 'loading', loading: true });
     this._update();
 
@@ -1019,71 +710,38 @@ class MetaEngineerPanel {
         try {
           const content = await tailReadFile(sessionFile, config.maxTailBytes);
           const messages = parseJsonlMessages(content);
-          const extracted = extractRecentMessages(
-            messages,
-            config.maxAssistantMessages,
-            config.maxUserMessages
-          );
+          const extracted = extractRecentMessages(messages, config.maxAssistantMessages, config.maxUserMessages);
           assistantMessages = extracted.assistantMessages;
           userMessages = extracted.userMessages;
-        } catch (err) {
-          console.warn('Failed to read session file:', err);
-        }
+        } catch { /* */ }
       }
 
-      // Build context for Meta Engineer
       const contextParts: string[] = [];
-      contextParts.push(`WORKSPACE: ${workspaceRoot}`);
-      contextParts.push('');
-      contextParts.push('=== CURRENT CLAUDE CODE SESSION CONTEXT ===');
-
+      contextParts.push(`WORKSPACE: ${workspaceRoot}\n`);
+      contextParts.push('=== CLAUDE CODE SESSION ===');
       if (userMessages.length > 0) {
-        contextParts.push('Recent user messages to Claude:');
-        userMessages.forEach((msg, i) => {
-          const truncated = msg.length > 1500 ? msg.slice(0, 1500) + '...[truncated]' : msg;
-          contextParts.push(`[User ${i + 1}] ${truncated}`);
-        });
-        contextParts.push('');
+        contextParts.push('User messages:');
+        userMessages.forEach((msg, i) => contextParts.push(`[${i + 1}] ${msg.slice(0, 1500)}`));
       }
-
       if (assistantMessages.length > 0) {
-        contextParts.push('Recent Claude responses:');
-        assistantMessages.forEach((msg, i) => {
-          const truncated = msg.length > 1500 ? msg.slice(0, 1500) + '...[truncated]' : msg;
-          contextParts.push(`[Claude ${i + 1}] ${truncated}`);
-        });
-        contextParts.push('');
+        contextParts.push('\nClaude responses:');
+        assistantMessages.forEach((msg, i) => contextParts.push(`[${i + 1}] ${msg.slice(0, 1500)}`));
       }
-
-      // Add Meta Engineer conversation history
-      if (this._messages.length > 1) {
-        contextParts.push('=== META ENGINEER CONVERSATION HISTORY ===');
-        const historyToInclude = this._messages.slice(0, -1).slice(-6); // Last 6 messages, excluding current
-        historyToInclude.forEach(msg => {
-          contextParts.push(`[${msg.role === 'user' ? 'You' : 'Meta Engineer'}]: ${msg.content}`);
+      if (this._metaMessages.length > 1) {
+        contextParts.push('\n=== META CONVERSATION ===');
+        this._metaMessages.slice(0, -1).slice(-6).forEach(msg => {
+          contextParts.push(`[${msg.role}]: ${msg.content}`);
         });
-        contextParts.push('');
       }
+      contextParts.push(`\n=== QUESTION ===\n${query}`);
 
-      contextParts.push('=== CURRENT QUESTION ===');
-      contextParts.push(query);
-
-      const payload = contextParts.join('\n');
-      const rawOutput = await invokeClaudeCli(payload, META_ENGINEER_SYSTEM_PROMPT);
-
-      // Add assistant response to history
-      this._messages.push({
-        role: 'assistant',
-        content: rawOutput.trim(),
-        timestamp: Date.now(),
-      });
-
+      const rawOutput = await invokeClaudeCli(contextParts.join('\n'), META_ENGINEER_SYSTEM_PROMPT);
+      this._metaMessages.push({ role: 'assistant', content: rawOutput.trim(), timestamp: Date.now() });
       this._update();
     } catch (err) {
+      this._metaMessages.pop();
       const errorMsg = err instanceof Error ? err.message : String(err);
-      // Remove the user message if we failed
-      this._messages.pop();
-      this._sendError(`Meta Engineer failed: ${errorMsg}`);
+      this._sendError(`Failed: ${errorMsg}`);
       this._update();
     } finally {
       this._panel.webview.postMessage({ command: 'loading', loading: false });
@@ -1091,22 +749,15 @@ class MetaEngineerPanel {
   }
 
   private _sendError(message: string) {
-    this._panel.webview.postMessage({
-      command: 'error',
-      message,
-    });
+    this._panel.webview.postMessage({ command: 'error', message });
   }
 
   public dispose() {
-    MetaEngineerPanel.currentPanel = undefined;
-
+    PromptShaperPanel.currentPanel = undefined;
     this._panel.dispose();
-
     while (this._disposables.length) {
       const x = this._disposables.pop();
-      if (x) {
-        x.dispose();
-      }
+      if (x) x.dispose();
     }
   }
 
@@ -1116,7 +767,7 @@ class MetaEngineerPanel {
 
   private _getHtmlForWebview() {
     const nonce = getNonce();
-    const messagesJson = JSON.stringify(this._messages);
+    const workspaceName = path.basename(getActiveWorkspaceRoot() || 'No workspace');
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -1124,149 +775,267 @@ class MetaEngineerPanel {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
-  <title>Prompt Shaper</title>
+  <title>Claude Speak</title>
   <style>
-    :root {
-      --bg-primary: var(--vscode-editor-background);
-      --bg-secondary: var(--vscode-sideBar-background);
-      --text-primary: var(--vscode-editor-foreground);
-      --text-secondary: var(--vscode-descriptionForeground);
-      --border-color: var(--vscode-panel-border);
-      --accent-color: var(--vscode-button-background);
-      --accent-hover: var(--vscode-button-hoverBackground);
-      --input-bg: var(--vscode-input-background);
-      --input-border: var(--vscode-input-border);
-    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
 
-    * {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
+    :root {
+      --bg: #1a1a1a;
+      --bg-secondary: #252525;
+      --bg-tertiary: #2d2d2d;
+      --text: #e5e5e5;
+      --text-dim: #888;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --border: #333;
+      --green: #22c55e;
+      --yellow: #eab308;
+      --red: #ef4444;
+      --radius: 8px;
+      --radius-lg: 12px;
     }
 
     body {
-      font-family: var(--vscode-font-family);
-      font-size: var(--vscode-font-size);
-      color: var(--text-primary);
-      background: var(--bg-primary);
+      font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', sans-serif;
+      font-size: 13px;
+      color: var(--text);
+      background: var(--bg);
       height: 100vh;
       display: flex;
       flex-direction: column;
+      -webkit-font-smoothing: antialiased;
     }
 
+    /* Title bar - Mac style */
+    .titlebar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 16px;
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border);
+      -webkit-app-region: drag;
+    }
+
+    .titlebar-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 6px var(--green);
+      transition: all 0.3s;
+    }
+
+    .status-dot.disconnected {
+      background: var(--red);
+      box-shadow: 0 0 6px var(--red);
+    }
+
+    .title {
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: -0.3px;
+    }
+
+    .workspace-badge {
+      font-size: 11px;
+      color: var(--text-dim);
+      background: var(--bg-tertiary);
+      padding: 3px 8px;
+      border-radius: 4px;
+    }
+
+    /* Tab navigation */
     .tabs {
       display: flex;
-      border-bottom: 1px solid var(--border-color);
       background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border);
+      padding: 0 8px;
     }
 
     .tab {
-      padding: 12px 24px;
+      padding: 10px 16px;
       cursor: pointer;
       border: none;
       background: transparent;
-      color: var(--text-secondary);
-      font-size: 14px;
+      color: var(--text-dim);
+      font-size: 12px;
       font-weight: 500;
       transition: all 0.2s;
       border-bottom: 2px solid transparent;
+      margin-bottom: -1px;
     }
 
-    .tab:hover {
-      color: var(--text-primary);
-      background: rgba(255,255,255,0.05);
-    }
-
+    .tab:hover { color: var(--text); }
     .tab.active {
-      color: var(--text-primary);
-      border-bottom-color: var(--accent-color);
+      color: var(--text);
+      border-bottom-color: var(--accent);
     }
 
-    .tab-content {
+    /* Content areas */
+    .content {
       flex: 1;
-      display: none;
+      display: flex;
       flex-direction: column;
       overflow: hidden;
     }
 
-    .tab-content.active {
-      display: flex;
+    .tab-content {
+      display: none;
+      flex: 1;
+      flex-direction: column;
+      overflow: hidden;
     }
+
+    .tab-content.active { display: flex; }
 
     .panel {
       flex: 1;
-      padding: 20px;
-      overflow-y: auto;
-      display: flex;
-      flex-direction: column;
-      gap: 16px;
-    }
-
-    .input-area {
       padding: 16px;
-      border-top: 1px solid var(--border-color);
-      background: var(--bg-secondary);
+      overflow-y: auto;
     }
 
-    .input-wrapper {
+    /* Input area */
+    .input-area {
+      padding: 12px 16px;
+      background: var(--bg-secondary);
+      border-top: 1px solid var(--border);
+    }
+
+    .input-row {
       display: flex;
-      gap: 12px;
+      gap: 8px;
     }
 
     textarea {
       flex: 1;
-      padding: 12px;
-      border: 1px solid var(--input-border);
-      border-radius: 6px;
-      background: var(--input-bg);
-      color: var(--text-primary);
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--bg);
+      color: var(--text);
       font-family: inherit;
-      font-size: 14px;
+      font-size: 13px;
       resize: none;
-      min-height: 60px;
+      min-height: 44px;
+      transition: border-color 0.2s;
     }
 
     textarea:focus {
       outline: none;
-      border-color: var(--accent-color);
+      border-color: var(--accent);
     }
+
+    textarea::placeholder { color: var(--text-dim); }
 
     button {
-      padding: 12px 24px;
+      padding: 10px 16px;
       border: none;
-      border-radius: 6px;
-      background: var(--accent-color);
-      color: var(--vscode-button-foreground);
+      border-radius: var(--radius);
+      background: var(--accent);
+      color: white;
       cursor: pointer;
-      font-size: 14px;
+      font-size: 12px;
       font-weight: 500;
-      transition: background 0.2s;
+      transition: all 0.2s;
     }
 
-    button:hover {
-      background: var(--accent-hover);
-    }
+    button:hover { background: var(--accent-hover); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
 
-    button:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
-
-    button.secondary {
+    button.ghost {
       background: transparent;
-      border: 1px solid var(--border-color);
-      color: var(--text-secondary);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
     }
 
-    button.secondary:hover {
-      background: rgba(255,255,255,0.05);
-      color: var(--text-primary);
+    button.ghost:hover {
+      background: var(--bg-tertiary);
+      color: var(--text);
     }
 
+    button.small {
+      padding: 6px 10px;
+      font-size: 11px;
+    }
+
+    /* Messages */
+    .messages {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .message {
+      padding: 12px 14px;
+      border-radius: var(--radius-lg);
+      max-width: 90%;
+      line-height: 1.5;
+    }
+
+    .message.user {
+      background: var(--accent);
+      color: white;
+      align-self: flex-end;
+      border-bottom-right-radius: 4px;
+    }
+
+    .message.assistant {
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border);
+      align-self: flex-start;
+      border-bottom-left-radius: 4px;
+    }
+
+    .message-content {
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    /* Transcript */
+    .transcript-item {
+      padding: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .transcript-item:last-child { border-bottom: none; }
+
+    .transcript-role {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+      color: var(--text-dim);
+    }
+
+    .transcript-role.user { color: var(--accent); }
+    .transcript-role.assistant { color: var(--green); }
+
+    .transcript-content {
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.5;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+
+    .transcript-time {
+      font-size: 10px;
+      color: var(--text-dim);
+      margin-top: 6px;
+    }
+
+    /* Result card */
     .result-card {
       background: var(--bg-secondary);
-      border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
       padding: 16px;
     }
 
@@ -1279,258 +1048,175 @@ class MetaEngineerPanel {
 
     .result-title {
       font-weight: 600;
-      font-size: 16px;
+      font-size: 14px;
     }
 
     .result-content {
-      background: var(--input-bg);
+      background: var(--bg);
       padding: 12px;
-      border-radius: 6px;
+      border-radius: var(--radius);
       white-space: pre-wrap;
-      font-family: var(--vscode-editor-font-family);
-      font-size: 13px;
+      font-family: 'SF Mono', Monaco, monospace;
+      font-size: 12px;
       line-height: 1.5;
-      max-height: 300px;
+      max-height: 250px;
       overflow-y: auto;
     }
 
     .meta-list {
       margin-top: 12px;
       padding-left: 20px;
+      color: var(--text-dim);
     }
 
-    .meta-list li {
-      margin: 4px 0;
-      color: var(--text-secondary);
-    }
+    .meta-list li { margin: 4px 0; }
 
-    .message {
-      padding: 12px 16px;
-      border-radius: 8px;
-      max-width: 85%;
-    }
-
-    .message.user {
-      background: var(--accent-color);
-      color: var(--vscode-button-foreground);
-      align-self: flex-end;
-      margin-left: auto;
-    }
-
-    .message.assistant {
-      background: var(--bg-secondary);
-      border: 1px solid var(--border-color);
-      align-self: flex-start;
-    }
-
-    .message-content {
-      white-space: pre-wrap;
-      line-height: 1.5;
-    }
-
-    .messages-container {
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-      flex: 1;
-    }
-
+    /* Empty state */
     .empty-state {
       display: flex;
       flex-direction: column;
       align-items: center;
       justify-content: center;
       height: 100%;
-      color: var(--text-secondary);
+      color: var(--text-dim);
       text-align: center;
-      gap: 12px;
+      gap: 8px;
     }
 
-    .empty-state-icon {
-      font-size: 48px;
+    .empty-icon {
+      font-size: 32px;
       opacity: 0.5;
     }
 
+    /* Loading */
     .loading {
       display: flex;
       align-items: center;
       gap: 8px;
-      color: var(--text-secondary);
+      color: var(--text-dim);
       padding: 12px;
     }
 
     .spinner {
-      width: 16px;
-      height: 16px;
-      border: 2px solid var(--border-color);
-      border-top-color: var(--accent-color);
+      width: 14px;
+      height: 14px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
       border-radius: 50%;
       animation: spin 1s linear infinite;
     }
 
-    @keyframes spin {
-      to { transform: rotate(360deg); }
-    }
+    @keyframes spin { to { transform: rotate(360deg); } }
 
-    .header-actions {
-      display: flex;
-      gap: 8px;
-    }
-
+    /* Error */
     .error {
-      background: var(--vscode-inputValidation-errorBackground);
-      border: 1px solid var(--vscode-inputValidation-errorBorder);
-      color: var(--vscode-inputValidation-errorForeground);
+      background: rgba(239, 68, 68, 0.1);
+      border: 1px solid var(--red);
+      color: var(--red);
       padding: 12px;
-      border-radius: 6px;
-    }
-
-    .placeholder-text {
-      color: var(--text-secondary);
-      font-style: italic;
-    }
-
-    .context-bar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 8px 16px;
-      background: var(--bg-secondary);
-      border-bottom: 1px solid var(--border-color);
+      border-radius: var(--radius);
       font-size: 12px;
     }
 
-    .context-info {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      color: var(--text-secondary);
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb {
+      background: var(--border);
+      border-radius: 3px;
     }
-
-    .context-label {
-      font-weight: 500;
-      color: var(--text-primary);
-    }
-
-    .context-value {
-      background: var(--input-bg);
-      padding: 2px 8px;
-      border-radius: 4px;
-      font-family: var(--vscode-editor-font-family);
-    }
-
-    .context-status {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    .context-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: #4ade80;
-    }
-
-    .context-dot.warning {
-      background: #fbbf24;
-    }
-
-    .context-dot.error {
-      background: #f87171;
-    }
-
-    .refresh-btn {
-      padding: 4px 8px;
-      font-size: 11px;
-      background: transparent;
-      border: 1px solid var(--border-color);
-      color: var(--text-secondary);
-    }
-
-    .refresh-btn:hover {
-      background: rgba(255,255,255,0.05);
-      color: var(--text-primary);
-    }
+    ::-webkit-scrollbar-thumb:hover { background: #444; }
   </style>
 </head>
 <body>
-  <div class="context-bar">
-    <div class="context-info">
-      <span class="context-label">Context:</span>
-      <span class="context-value" id="context-workspace">${escapeHtml(path.basename(getActiveWorkspaceRoot() || 'No workspace'))}</span>
-      <span class="context-status">
-        <span class="context-dot" id="context-dot"></span>
-        <span id="context-status-text">Ready</span>
-      </span>
+  <div class="titlebar">
+    <div class="titlebar-left">
+      <div class="status-dot ${this._isConnected ? '' : 'disconnected'}" id="status-dot" title="${this._isConnected ? 'Connected' : 'Disconnected'}"></div>
+      <span class="title">Claude Speak</span>
     </div>
-    <button class="refresh-btn" id="refresh-context-btn" title="Refresh context">Refresh</button>
+    <span class="workspace-badge">${escapeHtml(workspaceName)}</span>
   </div>
+
   <div class="tabs">
-    <button class="tab ${this._currentTab === 'shaper' ? 'active' : ''}" data-tab="shaper">
-      Prompt Shaper
-    </button>
-    <button class="tab ${this._currentTab === 'meta' ? 'active' : ''}" data-tab="meta">
-      Meta Engineer
-    </button>
+    <button class="tab ${this._currentTab === 'shaper' ? 'active' : ''}" data-tab="shaper">Shaper</button>
+    <button class="tab ${this._currentTab === 'meta' ? 'active' : ''}" data-tab="meta">Meta Engineer</button>
+    <button class="tab ${this._currentTab === 'transcript' ? 'active' : ''}" data-tab="transcript">Transcript</button>
   </div>
 
-  <!-- Prompt Shaper Tab -->
-  <div class="tab-content ${this._currentTab === 'shaper' ? 'active' : ''}" id="shaper-tab">
-    <div class="panel" id="shaper-panel">
-      <div class="empty-state" id="shaper-empty">
-        <div class="empty-state-icon">&#128221;</div>
-        <div>Paste your dictated text below to shape it into a structured prompt</div>
+  <div class="content">
+    <!-- Shaper Tab -->
+    <div class="tab-content ${this._currentTab === 'shaper' ? 'active' : ''}" id="shaper-tab">
+      <div class="panel" id="shaper-panel">
+        <div class="empty-state" id="shaper-empty">
+          <div class="empty-icon">✨</div>
+          <div>Transform your dictated thoughts into structured prompts</div>
+        </div>
+        <div id="shaper-result" style="display: none;"></div>
+        <div id="shaper-loading" class="loading" style="display: none;">
+          <div class="spinner"></div>
+          <span>Shaping...</span>
+        </div>
       </div>
-      <div id="shaper-result" style="display: none;"></div>
-      <div id="shaper-loading" class="loading" style="display: none;">
-        <div class="spinner"></div>
-        <span>Shaping prompt with Claude...</span>
-      </div>
-    </div>
-    <div class="input-area">
-      <div class="input-wrapper">
-        <textarea
-          id="shaper-input"
-          placeholder="Paste your dictated text here... (e.g., 'I want to add a button that shows user settings')"
-          rows="3"
-        ></textarea>
-        <button id="shape-btn">Shape</button>
+      <div class="input-area">
+        <div class="input-row">
+          <textarea id="shaper-input" placeholder="Paste your dictation here..." rows="2"></textarea>
+          <button id="shape-btn">Shape</button>
+        </div>
       </div>
     </div>
-  </div>
 
-  <!-- Meta Engineer Tab -->
-  <div class="tab-content ${this._currentTab === 'meta' ? 'active' : ''}" id="meta-tab">
-    <div class="panel" id="meta-panel">
-      <div class="messages-container" id="meta-messages">
-        ${this._messages.length === 0 ? `
-          <div class="empty-state">
-            <div class="empty-state-icon">&#129302;</div>
-            <div><strong>Meta Engineer</strong></div>
-            <div>Ask questions about your current conversation without affecting the main chat.</div>
-            <div class="placeholder-text">e.g., "Am I approaching this problem correctly?" or "What am I missing?"</div>
-          </div>
-        ` : this._messages.map(msg => `
-          <div class="message ${msg.role}">
-            <div class="message-content">${escapeHtml(msg.content)}</div>
-          </div>
-        `).join('')}
+    <!-- Meta Engineer Tab -->
+    <div class="tab-content ${this._currentTab === 'meta' ? 'active' : ''}" id="meta-tab">
+      <div class="panel">
+        <div class="messages" id="meta-messages">
+          ${this._metaMessages.length === 0 ? `
+            <div class="empty-state">
+              <div class="empty-icon">🧠</div>
+              <div><strong>Meta Engineer</strong></div>
+              <div style="font-size: 12px;">Ask questions about your conversation without affecting the main chat</div>
+            </div>
+          ` : this._metaMessages.map(msg => `
+            <div class="message ${msg.role}">
+              <div class="message-content">${escapeHtml(msg.content)}</div>
+            </div>
+          `).join('')}
+        </div>
+        <div id="meta-loading" class="loading" style="display: none;">
+          <div class="spinner"></div>
+          <span>Thinking...</span>
+        </div>
       </div>
-      <div id="meta-loading" class="loading" style="display: none;">
-        <div class="spinner"></div>
-        <span>Meta Engineer is thinking...</span>
+      <div class="input-area">
+        <div class="input-row">
+          <textarea id="meta-input" placeholder="Ask about your conversation..." rows="2"></textarea>
+          <button id="meta-btn">Ask</button>
+          <button id="clear-meta-btn" class="ghost small">Clear</button>
+        </div>
       </div>
     </div>
-    <div class="input-area">
-      <div class="input-wrapper">
-        <textarea
-          id="meta-input"
-          placeholder="Ask Meta Engineer about your current conversation..."
-          rows="2"
-        ></textarea>
-        <button id="meta-btn">Ask</button>
-        <button id="clear-meta-btn" class="secondary" title="Clear conversation">Clear</button>
+
+    <!-- Transcript Tab -->
+    <div class="tab-content ${this._currentTab === 'transcript' ? 'active' : ''}" id="transcript-tab">
+      <div class="panel">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+          <span style="font-weight: 500;">Chat Transcript</span>
+          <button id="refresh-transcript-btn" class="ghost small">↻ Refresh</button>
+        </div>
+        <div id="transcript-container">
+          ${this._transcript.length === 0 ? `
+            <div class="empty-state">
+              <div class="empty-icon">💬</div>
+              <div>No transcript available</div>
+              <div style="font-size: 11px; color: var(--text-dim);">Start a conversation with Claude Code to see it here</div>
+            </div>
+          ` : this._transcript.map(msg => `
+            <div class="transcript-item">
+              <div class="transcript-role ${msg.role}">${msg.role === 'user' ? 'You' : 'Claude'}</div>
+              <div class="transcript-content">${escapeHtml(msg.content)}</div>
+              ${msg.timestamp ? `<div class="transcript-time">${formatTimestamp(msg.timestamp)}</div>` : ''}
+            </div>
+          `).join('')}
+        </div>
       </div>
     </div>
   </div>
@@ -1545,7 +1231,7 @@ class MetaEngineerPanel {
       });
     });
 
-    // Prompt Shaper
+    // Shaper
     const shaperInput = document.getElementById('shaper-input');
     const shapeBtn = document.getElementById('shape-btn');
     const shaperEmpty = document.getElementById('shaper-empty');
@@ -1554,15 +1240,11 @@ class MetaEngineerPanel {
 
     shapeBtn.addEventListener('click', () => {
       const text = shaperInput.value.trim();
-      if (text) {
-        vscode.postMessage({ command: 'shapePrompt', text });
-      }
+      if (text) vscode.postMessage({ command: 'shapePrompt', text });
     });
 
     shaperInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-        shapeBtn.click();
-      }
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) shapeBtn.click();
     });
 
     // Meta Engineer
@@ -1581,29 +1263,27 @@ class MetaEngineerPanel {
     });
 
     metaInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-        metaBtn.click();
-      }
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) metaBtn.click();
     });
 
     clearMetaBtn.addEventListener('click', () => {
       vscode.postMessage({ command: 'clearMetaHistory' });
     });
 
-    // Refresh context button
-    const refreshContextBtn = document.getElementById('refresh-context-btn');
-    const contextWorkspace = document.getElementById('context-workspace');
-    const contextDot = document.getElementById('context-dot');
-    const contextStatusText = document.getElementById('context-status-text');
-
-    refreshContextBtn.addEventListener('click', () => {
-      vscode.postMessage({ command: 'refreshContext' });
+    // Transcript
+    const refreshTranscriptBtn = document.getElementById('refresh-transcript-btn');
+    refreshTranscriptBtn?.addEventListener('click', () => {
+      vscode.postMessage({ command: 'refreshTranscript' });
     });
 
-    // Handle messages from extension
+    // Status dot click to refresh
+    document.getElementById('status-dot').addEventListener('click', () => {
+      vscode.postMessage({ command: 'refreshConnection' });
+    });
+
+    // Handle messages
     window.addEventListener('message', event => {
       const message = event.data;
-
       switch (message.command) {
         case 'loading':
           shaperLoading.style.display = message.loading ? 'flex' : 'none';
@@ -1611,7 +1291,6 @@ class MetaEngineerPanel {
           shapeBtn.disabled = message.loading;
           metaBtn.disabled = message.loading;
           break;
-
         case 'shapeResult':
           shaperEmpty.style.display = 'none';
           shaperResult.style.display = 'block';
@@ -1619,43 +1298,29 @@ class MetaEngineerPanel {
             <div class="result-card">
               <div class="result-header">
                 <span class="result-title">\${escapeHtml(message.result.title)}</span>
-                <button onclick="copyResult()">Copy to Clipboard</button>
+                <button class="small" onclick="copyResult()">Copy</button>
               </div>
               <div class="result-content" id="shaped-prompt">\${escapeHtml(message.result.send_to_claude)}</div>
               \${message.result.assumptions.length > 0 ? \`
-                <div style="margin-top: 16px;">
+                <div style="margin-top: 12px; font-size: 12px;">
                   <strong>Assumptions:</strong>
-                  <ul class="meta-list">
-                    \${message.result.assumptions.map(a => \`<li>\${escapeHtml(a)}</li>\`).join('')}
-                  </ul>
+                  <ul class="meta-list">\${message.result.assumptions.map(a => \`<li>\${escapeHtml(a)}</li>\`).join('')}</ul>
                 </div>
               \` : ''}
               \${message.result.questions.length > 0 ? \`
-                <div style="margin-top: 16px;">
-                  <strong>Questions (needs clarification):</strong>
-                  <ul class="meta-list">
-                    \${message.result.questions.map(q => \`<li>\${escapeHtml(q)}</li>\`).join('')}
-                  </ul>
+                <div style="margin-top: 12px; font-size: 12px;">
+                  <strong>Questions:</strong>
+                  <ul class="meta-list">\${message.result.questions.map(q => \`<li>\${escapeHtml(q)}</li>\`).join('')}</ul>
                 </div>
               \` : ''}
             </div>
           \`;
           shaperInput.value = '';
           break;
-
         case 'error':
-          const errorHtml = \`<div class="error">\${escapeHtml(message.message)}</div>\`;
-          if (document.getElementById('shaper-tab').classList.contains('active')) {
-            shaperEmpty.style.display = 'none';
-            shaperResult.style.display = 'block';
-            shaperResult.innerHTML = errorHtml;
-          }
-          break;
-
-        case 'contextUpdate':
-          contextWorkspace.textContent = message.workspace || 'No workspace';
-          contextDot.className = 'context-dot' + (message.status === 'warning' ? ' warning' : message.status === 'error' ? ' error' : '');
-          contextStatusText.textContent = message.statusText || 'Ready';
+          shaperEmpty.style.display = 'none';
+          shaperResult.style.display = 'block';
+          shaperResult.innerHTML = \`<div class="error">\${escapeHtml(message.message)}</div>\`;
           break;
       }
     });
@@ -1671,15 +1336,17 @@ class MetaEngineerPanel {
       return div.innerHTML;
     }
 
-    // Scroll to bottom of meta messages
-    if (metaMessages) {
-      metaMessages.scrollTop = metaMessages.scrollHeight;
-    }
+    // Scroll to bottom
+    if (metaMessages) metaMessages.scrollTop = metaMessages.scrollHeight;
   </script>
 </body>
 </html>`;
   }
 }
+
+// ============================================================================
+// Helpers
+// ============================================================================
 
 function getNonce() {
   let text = '';
@@ -1699,29 +1366,58 @@ function escapeHtml(text: string): string {
     .replace(/'/g, '&#039;');
 }
 
+function formatTimestamp(ts: string): string {
+  try {
+    const date = new Date(ts);
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  } catch {
+    return '';
+  }
+}
+
+function buildPayload(
+  workspace: string,
+  assistantMessages: string[],
+  userMessages: string[],
+  dictation: string
+): string {
+  const sections: string[] = [];
+  sections.push(`WORKSPACE: ${workspace}\n`);
+
+  if (assistantMessages.length > 0) {
+    sections.push('RECENT ASSISTANT MESSAGES:');
+    assistantMessages.forEach((msg, i) => {
+      sections.push(`[${i + 1}] ${msg.slice(0, 2000)}`);
+    });
+    sections.push('');
+  }
+
+  if (userMessages.length > 0) {
+    sections.push('RECENT USER MESSAGES:');
+    userMessages.forEach((msg, i) => {
+      sections.push(`[${i + 1}] ${msg.slice(0, 1000)}`);
+    });
+    sections.push('');
+  }
+
+  sections.push('RAW DICTATION:');
+  sections.push(dictation);
+
+  return sections.join('\n');
+}
+
 // ============================================================================
 // Extension Lifecycle
 // ============================================================================
 
 export function activate(context: vscode.ExtensionContext): void {
-  // Original command
-  const dictateCommand = vscode.commands.registerCommand(
-    'promptShaper.dictateAndShape',
-    dictateAndShape
-  );
-
-  // New panel command
   const openPanelCommand = vscode.commands.registerCommand(
     'promptShaper.openPanel',
-    () => {
-      MetaEngineerPanel.createOrShow(context.extensionUri);
-    }
+    () => PromptShaperPanel.createOrShow(context.extensionUri)
   );
 
-  context.subscriptions.push(dictateCommand);
   context.subscriptions.push(openPanelCommand);
-
-  console.log('Prompt Shaper extension activated');
+  console.log('Claude Speak extension activated');
 }
 
 export function deactivate(): void {
