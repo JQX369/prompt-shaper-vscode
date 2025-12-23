@@ -83,6 +83,64 @@ function getConfig() {
 }
 
 // ============================================================================
+// Active Workspace Detection
+// ============================================================================
+
+/**
+ * Detects the workspace root based on the currently active editor/tab.
+ * Falls back to first workspace folder if no active editor.
+ */
+function getActiveWorkspaceRoot(): string | null {
+  const workspaceFolders = vscode.workspace.workspaceFolders;
+
+  if (!workspaceFolders || workspaceFolders.length === 0) {
+    return null;
+  }
+
+  // If only one workspace, use it
+  if (workspaceFolders.length === 1) {
+    return workspaceFolders[0].uri.fsPath;
+  }
+
+  // Try to determine workspace from active editor
+  const activeEditor = vscode.window.activeTextEditor;
+  if (activeEditor) {
+    const activeFile = activeEditor.document.uri;
+    const workspaceFolder = vscode.workspace.getWorkspaceFolder(activeFile);
+    if (workspaceFolder) {
+      console.log(`Prompt Shaper: Detected workspace from active file: ${workspaceFolder.uri.fsPath}`);
+      return workspaceFolder.uri.fsPath;
+    }
+  }
+
+  // Try visible text editors
+  for (const editor of vscode.window.visibleTextEditors) {
+    const workspaceFolder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
+    if (workspaceFolder) {
+      console.log(`Prompt Shaper: Detected workspace from visible editor: ${workspaceFolder.uri.fsPath}`);
+      return workspaceFolder.uri.fsPath;
+    }
+  }
+
+  // Fall back to first workspace folder
+  console.log(`Prompt Shaper: Falling back to first workspace folder: ${workspaceFolders[0].uri.fsPath}`);
+  return workspaceFolders[0].uri.fsPath;
+}
+
+/**
+ * Gets info about the currently active context for display
+ */
+function getActiveContextInfo(): { workspace: string; activeFile: string | null } {
+  const workspaceRoot = getActiveWorkspaceRoot();
+  const activeEditor = vscode.window.activeTextEditor;
+
+  return {
+    workspace: workspaceRoot || 'Unknown',
+    activeFile: activeEditor ? path.basename(activeEditor.document.uri.fsPath) : null,
+  };
+}
+
+// ============================================================================
 // Claude Code Session Discovery
 // ============================================================================
 
@@ -562,15 +620,19 @@ function parseShapeOutput(raw: string): ShaperOutput {
 // ============================================================================
 
 async function dictateAndShape(): Promise<void> {
-  const workspaceFolders = vscode.workspace.workspaceFolders;
-  if (!workspaceFolders || workspaceFolders.length === 0) {
+  const workspaceRoot = getActiveWorkspaceRoot();
+  if (!workspaceRoot) {
     vscode.window.showErrorMessage(
       'Prompt Shaper: No workspace folder open. Please open a folder first.'
     );
     return;
   }
 
-  const workspaceRoot = workspaceFolders[0].uri.fsPath;
+  // Log what we detected
+  const contextInfo = getActiveContextInfo();
+  console.log(`Prompt Shaper: Active workspace: ${contextInfo.workspace}`);
+  console.log(`Prompt Shaper: Active file: ${contextInfo.activeFile || 'none'}`);
+
 
   const projectsPath = getClaudeProjectsPath();
   if (!fs.existsSync(projectsPath)) {
@@ -816,10 +878,42 @@ class MetaEngineerPanel {
             this._messages = [];
             this._update();
             break;
+          case 'refreshContext':
+            this._refreshContext();
+            break;
         }
       },
       null,
       this._disposables
+    );
+  }
+
+  private async _refreshContext() {
+    const workspaceRoot = getActiveWorkspaceRoot();
+    const contextInfo = getActiveContextInfo();
+
+    if (!workspaceRoot) {
+      this._panel.webview.postMessage({
+        command: 'contextUpdate',
+        workspace: 'No workspace',
+        status: 'error',
+        statusText: 'No workspace open',
+      });
+      return;
+    }
+
+    // Check if session file exists
+    const sessionFile = await findBestSessionFile(workspaceRoot);
+
+    this._panel.webview.postMessage({
+      command: 'contextUpdate',
+      workspace: path.basename(workspaceRoot),
+      status: sessionFile ? 'ok' : 'warning',
+      statusText: sessionFile ? `Session found` : 'No session found',
+    });
+
+    vscode.window.showInformationMessage(
+      `Context: ${path.basename(workspaceRoot)}${contextInfo.activeFile ? ` (${contextInfo.activeFile})` : ''}`
     );
   }
 
@@ -828,13 +922,16 @@ class MetaEngineerPanel {
       return;
     }
 
-    const workspaceFolders = vscode.workspace.workspaceFolders;
-    if (!workspaceFolders || workspaceFolders.length === 0) {
+    const workspaceRoot = getActiveWorkspaceRoot();
+    if (!workspaceRoot) {
       this._sendError('No workspace folder open. Please open a folder first.');
       return;
     }
 
-    const workspaceRoot = workspaceFolders[0].uri.fsPath;
+    // Log detected context
+    const contextInfo = getActiveContextInfo();
+    console.log(`Prompt Shaper Panel: Using workspace: ${contextInfo.workspace}`);
+    console.log(`Prompt Shaper Panel: Active file: ${contextInfo.activeFile || 'none'}`);
 
     if (!isClaudeCliInstalled()) {
       this._sendError('Claude CLI not found on PATH. Please install Claude Code CLI.');
@@ -886,13 +983,16 @@ class MetaEngineerPanel {
       return;
     }
 
-    const workspaceFolders = vscode.workspace.workspaceFolders;
-    if (!workspaceFolders || workspaceFolders.length === 0) {
+    const workspaceRoot = getActiveWorkspaceRoot();
+    if (!workspaceRoot) {
       this._sendError('No workspace folder open. Please open a folder first.');
       return;
     }
 
-    const workspaceRoot = workspaceFolders[0].uri.fsPath;
+    // Log detected context
+    const contextInfo = getActiveContextInfo();
+    console.log(`Meta Engineer: Using workspace: ${contextInfo.workspace}`);
+    console.log(`Meta Engineer: Active file: ${contextInfo.activeFile || 'none'}`);
 
     if (!isClaudeCliInstalled()) {
       this._sendError('Claude CLI not found on PATH. Please install Claude Code CLI.');
@@ -1289,9 +1389,83 @@ class MetaEngineerPanel {
       color: var(--text-secondary);
       font-style: italic;
     }
+
+    .context-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 16px;
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border-color);
+      font-size: 12px;
+    }
+
+    .context-info {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      color: var(--text-secondary);
+    }
+
+    .context-label {
+      font-weight: 500;
+      color: var(--text-primary);
+    }
+
+    .context-value {
+      background: var(--input-bg);
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-family: var(--vscode-editor-font-family);
+    }
+
+    .context-status {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .context-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #4ade80;
+    }
+
+    .context-dot.warning {
+      background: #fbbf24;
+    }
+
+    .context-dot.error {
+      background: #f87171;
+    }
+
+    .refresh-btn {
+      padding: 4px 8px;
+      font-size: 11px;
+      background: transparent;
+      border: 1px solid var(--border-color);
+      color: var(--text-secondary);
+    }
+
+    .refresh-btn:hover {
+      background: rgba(255,255,255,0.05);
+      color: var(--text-primary);
+    }
   </style>
 </head>
 <body>
+  <div class="context-bar">
+    <div class="context-info">
+      <span class="context-label">Context:</span>
+      <span class="context-value" id="context-workspace">${escapeHtml(path.basename(getActiveWorkspaceRoot() || 'No workspace'))}</span>
+      <span class="context-status">
+        <span class="context-dot" id="context-dot"></span>
+        <span id="context-status-text">Ready</span>
+      </span>
+    </div>
+    <button class="refresh-btn" id="refresh-context-btn" title="Refresh context">Refresh</button>
+  </div>
   <div class="tabs">
     <button class="tab ${this._currentTab === 'shaper' ? 'active' : ''}" data-tab="shaper">
       Prompt Shaper
@@ -1416,6 +1590,16 @@ class MetaEngineerPanel {
       vscode.postMessage({ command: 'clearMetaHistory' });
     });
 
+    // Refresh context button
+    const refreshContextBtn = document.getElementById('refresh-context-btn');
+    const contextWorkspace = document.getElementById('context-workspace');
+    const contextDot = document.getElementById('context-dot');
+    const contextStatusText = document.getElementById('context-status-text');
+
+    refreshContextBtn.addEventListener('click', () => {
+      vscode.postMessage({ command: 'refreshContext' });
+    });
+
     // Handle messages from extension
     window.addEventListener('message', event => {
       const message = event.data;
@@ -1466,6 +1650,12 @@ class MetaEngineerPanel {
             shaperResult.style.display = 'block';
             shaperResult.innerHTML = errorHtml;
           }
+          break;
+
+        case 'contextUpdate':
+          contextWorkspace.textContent = message.workspace || 'No workspace';
+          contextDot.className = 'context-dot' + (message.status === 'warning' ? ' warning' : message.status === 'error' ? ' error' : '');
+          contextStatusText.textContent = message.statusText || 'Ready';
           break;
       }
     });
